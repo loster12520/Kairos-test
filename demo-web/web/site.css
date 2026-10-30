@@ -1,0 +1,24 @@
+/* Hand written base styles. Kairos only emits the atomic classes it owns, so a project can
+   keep its reset / layout / typography in a normal stylesheet. The atomic rules are loaded
+   after this file and live in the `kairos` cascade layer. */
+:root {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+section {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin-top: 32px;
+}
+
+header > div {
+  display: flex;
+}
+
+button + button {
+  margin-left: 8px;
+}
