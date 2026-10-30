@@ -1,5 +1,7 @@
 # Kairos
 
+> 本项目仅为验证原型，不为可使用项目！！！
+
 用 Kotlin 写界面，编译期把样式算完。
 
 - **CSS in Kotlin**：`css { padding(16.px); borderRadius(12.px) }` 是一个真函数，编译器把它折叠成**一个类名**，并在编译期写出分层 CSS。
