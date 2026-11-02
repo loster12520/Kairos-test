@@ -2,6 +2,7 @@ package dev.kairos.browser
 
 import dev.kairos.render.ElementNode
 import dev.kairos.render.Node
+import dev.kairos.render.RawHtml
 import dev.kairos.render.TextNode
 import kotlinx.browser.document
 import org.w3c.dom.Element
@@ -43,6 +44,16 @@ fun on(element: Element?, event: String, handler: () -> Unit) {
 /** Builds real DOM from the shared node model, for client side rendering. */
 fun Node.toDom(): org.w3c.dom.Node = when (this) {
     is TextNode -> document.createTextNode(value)
+    is RawHtml -> {
+        val template = document.createElement("template") as org.w3c.dom.HTMLTemplateElement
+        template.innerHTML = html
+        template.content
+    }
+    is dev.kairos.render.FragmentNode -> {
+        val fragment = document.createDocumentFragment()
+        children.forEach { fragment.appendChild(it.toDom()) }
+        fragment
+    }
     is ElementNode -> {
         val element = document.createElement(tag)
         attributes.forEach { (name, value) -> element.setAttribute(name, value) }

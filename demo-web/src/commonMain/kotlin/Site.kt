@@ -26,6 +26,7 @@ import dev.kairos.render.section
 import dev.kairos.render.span
 import dev.kairos.render.src
 import dev.kairos.render.type
+import dev.kairos.render.ul
 import dev.kairos.runtime.Fonts
 import dev.kairos.runtime.Layer
 import dev.kairos.runtime.Radius
@@ -34,6 +35,7 @@ import dev.kairos.runtime.StyleScope
 import dev.kairos.runtime.alignItems
 import dev.kairos.runtime.backgroundColor
 import dev.kairos.runtime.border
+import dev.kairos.runtime.borderColor
 import dev.kairos.runtime.borderRadius
 import dev.kairos.runtime.borderTop
 import dev.kairos.runtime.color
@@ -43,15 +45,19 @@ import dev.kairos.runtime.display
 import dev.kairos.runtime.fontFamily
 import dev.kairos.runtime.fontSize
 import dev.kairos.runtime.fontWeight
+import dev.kairos.runtime.height
 import dev.kairos.runtime.gap
 import dev.kairos.runtime.justifyContent
+import dev.kairos.runtime.flexDirection
 import dev.kairos.runtime.letterSpacing
+import dev.kairos.runtime.listStyle
 import dev.kairos.runtime.lineHeight
 import dev.kairos.runtime.margin
 import dev.kairos.runtime.marginTop
 import dev.kairos.runtime.maxWidth
 import dev.kairos.runtime.padding
 import dev.kairos.runtime.styles
+import dev.kairos.runtime.width
 
 /**
  * The demo page. Each style block folds into ONE class (grouped); the shipped script only swaps
@@ -76,12 +82,18 @@ val pageStyle: String = css {
     fontFamily(Fonts.SANS)
     lineHeight("1.6")
     margin(Spacing.NONE)
+    // The shell below queries this container by name; a container must be an ancestor.
+    declaration("container-type", "inline-size")
+    declaration("container-name", "page")
 }
 
 val shellStyle: String = css {
     maxWidth("880px")
     margin("0 auto")
     padding("0 24px 64px 24px")
+    container("page (max-width: 640px)") {
+        padding("0 16px 40px 16px")
+    }
 }
 
 val headerStyle: String = css {
@@ -90,12 +102,24 @@ val headerStyle: String = css {
     justifyContent("space-between")
     gap(Spacing.LG)
     padding("20px 0")
+    supports("(backdrop-filter: blur(4px))") {
+        declaration("backdrop-filter", "blur(6px)")
+    }
 }
 
 val brandStyle: String = css {
     fontSize("18px")
     fontWeight("700")
     letterSpacing("-0.01em")
+    before {
+        declaration("content", "\"\"")
+        display("inline-block")
+        width("8px")
+        height("8px")
+        borderRadius(Radius.FULL)
+        backgroundColor("#7c5cff")
+        margin("0 8px 0 0")
+    }
 }
 
 val titleStyle: String = css {
@@ -109,6 +133,45 @@ val leadStyle: String = css {
     maxWidth("640px")
 }
 
+val keyedListStyle: String = css {
+    listStyle("none")
+    margin("0 0 12px 0")
+    padding("0")
+    display("flex")
+    flexDirection("column")
+    gap("6px")
+}
+
+val keyedItemStyle: String = css {
+    padding("6px 10px")
+    borderRadius(Radius.SM)
+    backgroundColor("#f2f3f7")
+}
+
+val modalOverlayStyle: String = css {
+    declaration("position", "fixed")
+    declaration("inset", "0")
+    backgroundColor("rgba(16, 18, 24, 0.45)")
+    display("flex")
+    alignItems("center")
+    justifyContent("center")
+    declaration("z-index", "50")
+}
+
+val modalCardStyle: String = css {
+    backgroundColor("#ffffff")
+    borderRadius(Radius.LG)
+    padding(Spacing.XXL)
+    maxWidth("420px")
+    width("100%")
+    declaration("box-shadow", "0 20px 50px rgba(0, 0, 0, 0.2)")
+}
+
+val modalHiddenStyle: String = css(Layer.Override) { display("none") }
+
+/** Used by the cascade acceptance check: an unlayered third-party rule must win over this. */
+val cascadeProbeStyle: String = css { backgroundColor("#ff0000") }
+
 val buttonStyle: String = css {
     declaration("font", "inherit")
     fontSize("14px")
@@ -118,6 +181,17 @@ val buttonStyle: String = css {
     backgroundColor("#ffffff")
     color("#16181d")
     cursor("pointer")
+    // Interactive states are part of the class identity and are compiled into the stylesheet.
+    hover {
+        backgroundColor("#f2f3f7")
+        borderColor("#b9bcc6")
+    }
+    focusVisible {
+        borderColor("#7c5cff")
+    }
+    active {
+        backgroundColor("#e8eaf0")
+    }
 }
 
 val cardStyle: String = css {
@@ -125,6 +199,9 @@ val cardStyle: String = css {
     backgroundColor("#ffffff")
     borderRadius(Radius.LG)
     padding("18px")
+    media("(max-width: 640px)") {
+        padding("14px")
+    }
 }
 
 /** A user defined wrapper. Inline, so the compiler expands it and keeps folding. */
@@ -190,7 +267,7 @@ fun buildPage(): ElementNode = htmlRoot {
     head {
         meta { charset = "utf-8" }
         meta { name = "viewport"; content = "width=device-width, initial-scale=1" }
-        el("title") { "Kairos - styles compiled, not computed".text }
+        add(el("title") { "Kairos - styles compiled, not computed".text })
         link { rel = "stylesheet"; href = "site.css" }
         link { rel = "stylesheet"; href = "kairos.css" }
     }
@@ -262,7 +339,73 @@ fun buildPage(): ElementNode = htmlRoot {
                         }
                     }
                 }
+                section {
+                    div {
+                        style = cardStyle
+                        h2 { style = styles(headingReset, cardTitleStyle); "Keyed list".text }
+                        p {
+                            style = mutedStyle
+                            "Adding an item reuses the existing DOM nodes instead of rebuilding the list.".text
+                        }
+                        ul {
+                            style = keyedListStyle
+                            dataKairosId = "keyed-list"
+                        }
+                        button {
+                            style = buttonStyle
+                            dataKairosId = "keyed-add"
+                            type = "button"
+                            "Add item".text
+                        }
+                    }
+                }
+                section {
+                    div {
+                        style = cardStyle
+                        h2 { style = styles(headingReset, cardTitleStyle); "Accessible modal".text }
+                        p {
+                            style = mutedStyle
+                            "Focus moves in, Tab stays inside, Escape closes it, focus returns to the trigger.".text
+                        }
+                        button {
+                            style = buttonStyle
+                            dataKairosId = "modal-open"
+                            type = "button"
+                            "Open modal".text
+                        }
+                    }
+                }
                 add(statsPanel())
+            }
+            div {
+                style = styles(modalOverlayStyle, modalHiddenStyle)
+                id = "shortcuts-modal"
+                attributes["role"] = "dialog"
+                attributes["aria-modal"] = "true"
+                attributes["aria-labelledby"] = "shortcuts-title"
+                div {
+                    style = modalCardStyle
+                    h2 {
+                        style = styles(headingReset, cardTitleStyle)
+                        id = "shortcuts-title"
+                        "Keyboard shortcuts".text
+                    }
+                    p {
+                        style = mutedStyle
+                        "Tab and Shift+Tab cycle inside this dialog. Escape closes it and returns focus.".text
+                    }
+                    button {
+                        style = buttonStyle
+                        id = "modal-close"
+                        type = "button"
+                        "Close".text
+                    }
+                }
+            }
+            div {
+                id = "cascade-probe"
+                style = cascadeProbeStyle
+                attributes["hidden"] = "true"
             }
             footer {
                 style = footerStyle

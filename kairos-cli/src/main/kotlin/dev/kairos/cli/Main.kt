@@ -27,6 +27,10 @@ fun main(args: Array<String>) {
             "report" -> report(options)
             "merge" -> merge(options)
             "prune" -> prune(options)
+            "init" -> initProject(options)
+            "check" -> checkProject(options)
+            "doctor" -> doctor(options)
+            "coverage" -> coverage(options)
             "-h", "--help", null -> usage()
             else -> {
                 System.err.println("unknown command: " + command)
@@ -40,7 +44,7 @@ fun main(args: Array<String>) {
     }
 }
 
-class ToolError(message: String) : RuntimeException(message)
+internal class ToolError(message: String) : RuntimeException(message)
 
 private class Options(private val values: Map<String, List<String>>, private val positionals: List<String>) {
     fun single(name: String): String? = values[name]?.lastOrNull()
@@ -86,8 +90,12 @@ private fun usage() {
             "usage:",
             "  kairos why <class> --map <kairos.map.json>",
             "  kairos report --map <kairos.map.json>",
-            "  kairos merge --out <kairos.css> --map <a.map.json> [--map <b.map.json> ...]",
-            "  kairos prune --css <in.css> [--out <out.css>] --unit <index.html> [--unit <app.js> ...]",
+            "  kairos merge --out <kairos.css> [--map-out <kairos.map.json>] --map <a.map.json> [--map <b.map.json> ...]",
+            "  kairos prune --css <in.css> [--out <out.css>] [--map <kairos.map.json>] --unit <index.html> [--unit <app.js> ...]",
+            "  kairos init <directory> [--template static|ktor-htmx|ktor-incremental]",
+            "  kairos check --map <kairos.map.json> --css <kairos.css> [--strict]",
+            "  kairos doctor",
+            "  kairos coverage --map <kairos.map.json>",
         ).joinToString(System.lineSeparator())
     )
 }
@@ -102,6 +110,9 @@ private fun why(options: Options) {
 
     println("class    " + rule.className)
     println("layer    " + rule.layer + "  (priority " + rule.layerIndex + ")")
+    if (rule.conditions.isNotEmpty()) {
+        rule.conditions.forEach { println("under    " + it.kind + " " + it.value) }
+    }
     println("declares " + rule.declarations.size)
     rule.declarations.forEach { println("  " + it.property + ": " + it.value) }
     println("sources  " + rule.sources.size)
@@ -144,6 +155,7 @@ private fun report(options: Options) {
     model.layers.forEachIndexed { index, layer ->
         println("  " + index + "  " + layer.padEnd(16) + model.rules.count { it.layer == layer })
     }
+    println("coverage " + model.coverage.rules + " rules, " + model.coverage.conditionalRules + " conditional, " + model.coverage.fallbackBlocks + " fallback blocks")
     println("conflicts " + model.conflicts.size)
     model.conflicts.forEach {
         val where = it.where?.let { w -> "  at " + w.file.replace('\\', '/').substringAfterLast('/') + ":" + w.line } ?: ""
@@ -191,13 +203,51 @@ private fun merge(options: Options) {
         }
     }
 
-    val layers = merged.values.map { it.layer }.distinct()
-        .sortedBy { name -> models.flatMap { it.rules }.firstOrNull { it.layer == name }?.layerIndex ?: 99 }
+    // Keep the full layer declaration even when a layer has no rules: the merged sheet must be
+    // shaped exactly like a single-module sheet.
+    val layers = reference.layers
     out.parentFile?.mkdirs()
     out.writeText(renderCss(merged.values.toList(), layers))
+
+    // The merged manifest travels with the merged stylesheet: debugging and library assets
+    // both need to know which module a rule came from after the build.
+    val mapOut = options.single("map-out")?.let(::File)
+        ?: File(out.parentFile ?: File("."), "kairos.map.json")
+    mapOut.parentFile?.mkdirs()
+    val conflicts = mergeConflicts(models)
+    val coverage = models.fold(Coverage.EMPTY) { total, model ->
+        Coverage(
+            total.rules + model.coverage.rules,
+            total.conditionalRules + model.coverage.conditionalRules,
+            total.fallbackBlocks + model.coverage.fallbackBlocks,
+        )
+    }
+    mapOut.writeText(renderMap(merged.values.toList(), layers, conflicts, models.map { it.module }, coverage))
     println("merged " + models.size + " modules into " + out.absolutePath)
     println("  classes " + merged.size)
     layers.forEach { layer -> println("  " + layer.padEnd(16) + merged.values.count { it.layer == layer }) }
+    println("  map        " + mapOut.absolutePath)
+    println("  conflicts  " + conflicts.size)
+}
+
+private fun mergeConflicts(models: List<KairosMap>): List<Conflict> {
+    val seen = LinkedHashSet<String>()
+    val out = ArrayList<Conflict>()
+    models.forEach { model ->
+        model.conflicts.forEach { conflict ->
+            val key = listOf(
+                conflict.property,
+                conflict.winnerLayer,
+                conflict.winnerValue,
+                conflict.loserLayer,
+                conflict.loserValue,
+                conflict.where?.file,
+                conflict.where?.line,
+            ).joinToString("|")
+            if (seen.add(key)) out += conflict
+        }
+    }
+    return out
 }
 
 private fun prune(options: Options) {
@@ -205,6 +255,7 @@ private fun prune(options: Options) {
     if (!cssFile.exists()) throw ToolError("css not found: " + cssFile)
     val out = File(options.single("out") ?: cssFile.absolutePath)
     val units = options.many("unit").map(::File)
+    val mapFile = options.single("map")?.let(::File)
     if (units.isEmpty()) throw ToolError("prune needs at least one --unit (a file that actually ships)")
     units.forEach { if (!it.exists()) throw ToolError("unit not found: " + it) }
 
@@ -236,20 +287,39 @@ private fun prune(options: Options) {
     println("  kept    " + kept)
     println("  dropped " + dropped)
     println("  written " + out.absolutePath)
+    if (mapFile != null && mapFile.exists()) {
+        // Keep the merged manifest in step with the shipped stylesheet, otherwise `why` resolves
+        // classes that no longer exist after pruning.
+        val model = loadMap(mapFile.absolutePath)
+        val shipped = model.rules.filter { it.className in used }
+        val coverage = model.coverage.copy(
+            rules = shipped.size,
+            conditionalRules = shipped.count { it.conditions.isNotEmpty() },
+        )
+        mapFile.writeText(renderMap(shipped, model.layers, model.conflicts, model.modules, coverage))
+        println("  map      " + mapFile.absolutePath + " (" + shipped.size + " rules)")
+    }
 }
 
 // -- model -------------------------------------------------------------------
 
-data class Source(val file: String, val line: Int, val column: Int)
-data class Declaration(val property: String, val value: String)
-data class Rule(
+internal data class Source(val file: String, val line: Int, val column: Int)
+internal data class Declaration(val property: String, val value: String)
+internal data class Condition(val kind: String, val value: String)
+internal data class Coverage(val rules: Int, val conditionalRules: Int, val fallbackBlocks: Int) {
+    companion object {
+        val EMPTY = Coverage(0, 0, 0)
+    }
+}
+internal data class Rule(
     val className: String,
     val layer: String,
     val layerIndex: Int,
+    val conditions: List<Condition>,
     val declarations: List<Declaration>,
     val sources: List<Source>,
 )
-data class Conflict(
+internal data class Conflict(
     val property: String,
     val winnerLayer: String,
     val winnerValue: String,
@@ -257,10 +327,12 @@ data class Conflict(
     val loserValue: String,
     val where: Source?,
 )
-data class KairosMap(
+internal data class KairosMap(
     val version: Int,
     val module: String,
+    val modules: List<String>,
     val layers: List<String>,
+    val coverage: Coverage,
     val rules: List<Rule>,
     val conflicts: List<Conflict>,
     val errors: List<String>,
@@ -277,17 +349,30 @@ private fun loadMap(path: String): KairosMap {
     if (!file.exists()) throw ToolError("map not found: " + path)
     val root = json.parseToJsonElement(file.readText()).jsonObject
     val version = root.int("version")
-    if (version != 3) throw ToolError("unsupported map version " + version + " in " + path + " (expected 3)")
+    if (version != 3 && version != 4) {
+        throw ToolError("unsupported map version " + version + " in " + path + " (expected 3 or 4)")
+    }
+    val module = root.string("module")
+    val modules = root.array("modules").map { it.jsonPrimitive.content }.ifEmpty { listOf(module) }
+    val coverage = root["coverage"]?.jsonObject?.let { element ->
+        Coverage(element.int("rules"), element.int("conditionalRules"), element.int("fallbackBlocks"))
+    } ?: Coverage.EMPTY
     return KairosMap(
         version = version,
-        module = root.string("module"),
+        module = module,
+        modules = modules,
         layers = root.array("layers").map { it.jsonPrimitive.content },
+        coverage = coverage,
         rules = root.array("rules").map { element ->
             val rule = element.jsonObject
             Rule(
                 className = rule.string("className"),
                 layer = rule.string("layer"),
                 layerIndex = rule.int("layerIndex"),
+                conditions = rule.array("conditions").map { condition ->
+                    val c = condition.jsonObject
+                    Condition(c.string("kind"), c.string("value"))
+                },
                 declarations = rule.array("declarations").map { declaration ->
                     val d = declaration.jsonObject
                     Declaration(d.string("property"), d.string("value"))
@@ -318,17 +403,274 @@ private fun JsonObject.string(name: String): String = this[name]?.jsonPrimitive?
 private fun JsonObject.int(name: String): Int = this[name]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
 private fun JsonObject.array(name: String): JsonArray = this[name]?.jsonArray ?: JsonArray(emptyList<JsonElement>())
 
+private fun renderMap(
+    rules: List<Rule>,
+    layers: List<String>,
+    conflicts: List<Conflict>,
+    modules: List<String>,
+    coverage: Coverage,
+): String = buildString {
+    appendLine("{")
+    appendLine("  \"version\": 4,")
+    appendLine("  \"module\": \"merged\",")
+    appendLine("  \"modules\": [" + modules.joinToString(", ") { "\"" + escape(it) + "\"" } + "],")
+    appendLine("  \"layers\": [" + layers.joinToString(", ") { "\"" + escape(it) + "\"" } + "],")
+    appendLine(
+        "  \"coverage\": { \"rules\": " + coverage.rules +
+            ", \"conditionalRules\": " + coverage.conditionalRules +
+            ", \"fallbackBlocks\": " + coverage.fallbackBlocks + " },"
+    )
+    appendLine("  \"rules\": [")
+    val sorted = rules.sortedBy { it.className }
+    sorted.forEachIndexed { index, rule ->
+        append("    { \"className\": \"").append(escape(rule.className)).append("\"")
+        append(", \"layer\": \"").append(escape(rule.layer)).append("\"")
+        append(", \"layerIndex\": ").append(rule.layerIndex)
+        append(", \"conditions\": [")
+        append(rule.conditions.joinToString(", ") {
+            "{ \"kind\": \"" + escape(it.kind) + "\", \"value\": \"" + escape(it.value) + "\" }"
+        })
+        append("], \"declarations\": [")
+        append(rule.declarations.joinToString(", ") {
+            "{ \"property\": \"" + escape(it.property) + "\", \"value\": \"" + escape(it.value) + "\" }"
+        })
+        append("], \"sources\": [")
+        append(rule.sources.joinToString(", ") {
+            "{ \"file\": \"" + escape(it.file) + "\", \"line\": " + it.line + ", \"column\": " + it.column + " }"
+        })
+        append("] }")
+        if (index != sorted.lastIndex) append(',')
+        appendLine()
+    }
+    appendLine("  ],")
+    appendLine("  \"conflicts\": [")
+    conflicts.forEachIndexed { index, conflict ->
+        append("    { \"property\": \"").append(escape(conflict.property)).append("\"")
+        append(", \"winnerLayer\": \"").append(escape(conflict.winnerLayer)).append("\"")
+        append(", \"winnerValue\": \"").append(escape(conflict.winnerValue)).append("\"")
+        append(", \"loserLayer\": \"").append(escape(conflict.loserLayer)).append("\"")
+        append(", \"loserValue\": \"").append(escape(conflict.loserValue)).append("\"")
+        conflict.where?.let {
+            append(", \"where\": { \"file\": \"").append(escape(it.file)).append("\", \"line\": ")
+                .append(it.line).append(", \"column\": ").append(it.column).append(" }")
+        }
+        append(" }")
+        if (index != conflicts.lastIndex) append(',')
+        appendLine()
+    }
+    appendLine("  ],")
+    appendLine("  \"errors\": [],")
+    appendLine("  \"notes\": []")
+    appendLine("}")
+}
+
+private fun escape(value: String): String = buildString {
+    value.forEach { ch ->
+        when {
+            ch == '\\' -> append("\\\\")
+            ch == '"' -> append("\\\"")
+            ch == '\n' -> append("\\n")
+            ch == '\r' -> append("\\r")
+            ch == '\t' -> append("\\t")
+            ch < ' ' -> append("\\u").append(ch.code.toString(16).padStart(4, '0'))
+            else -> append(ch)
+        }
+    }
+}
+
 private fun renderCss(rules: List<Rule>, layers: List<String>): String = buildString {
     appendLine("@layer " + layers.joinToString(", ") + ";")
     appendLine()
     layers.forEach { layer ->
-        val inLayer = rules.filter { it.layer == layer }.sortedBy { it.className }
+        val inLayer = rules.filter { it.layer == layer }
         if (inLayer.isEmpty()) return@forEach
         appendLine("@layer " + layer + " {")
-        inLayer.forEach { rule ->
-            appendLine("  ." + rule.className + " { " + rule.declarations.joinToString(" ") { it.property + ": " + it.value + ";" } + " }")
-        }
+        // Base and pseudo-class/pseudo-element rules first.
+        inLayer.filter { rule -> rule.conditions.none { it.kind in AT_RULE_KINDS } }
+            .sortedBy { it.className }
+            .forEach { rule -> appendLine("  " + selectorOf(rule) + " { " + bodyOf(rule) + " }") }
+        // At-rule groups, sorted for deterministic merged output.
+        inLayer.filter { rule -> rule.conditions.any { it.kind in AT_RULE_KINDS } }
+            .groupBy { rule -> rule.conditions.filter { it.kind in AT_RULE_KINDS }.joinToString(" | ") { atRuleOf(it) } }
+            .toSortedMap()
+            .forEach { (wrappersKey, group) ->
+                var indent = "  "
+                val wrappers = wrappersKey.split(" | ")
+                wrappers.forEach { wrapper ->
+                    appendLine(indent + wrapper + " {")
+                    indent += "  "
+                }
+                group.sortedBy { it.className }.forEach { rule ->
+                    appendLine(indent + selectorOf(rule) + " { " + bodyOf(rule) + " }")
+                }
+                wrappers.forEach { _ ->
+                    indent = indent.dropLast(2)
+                    appendLine(indent + "}")
+                }
+            }
         appendLine("}")
         appendLine()
+    }
+}
+
+private val AT_RULE_KINDS = setOf("media", "container", "supports")
+
+private fun selectorOf(rule: Rule): String {
+    val suffix = rule.conditions
+        .filter { it.kind == "pseudoClass" || it.kind == "pseudoElement" }
+        .joinToString("") { it.value }
+    return "." + rule.className + suffix
+}
+
+private fun bodyOf(rule: Rule): String =
+    rule.declarations.joinToString(" ") { it.property + ": " + it.value + ";" }
+
+private fun atRuleOf(condition: Condition): String = when (condition.kind) {
+    "media" -> "@media " + condition.value
+    "container" -> "@container " + condition.value
+    "supports" -> "@supports " + condition.value
+    else -> ""
+}
+
+
+// -- tooling commands ---------------------------------------------------------
+
+private fun initProject(options: Options) {
+    val directory = options.first()?.let(::File) ?: throw ToolError("missing target directory")
+    val template = options.single("template") ?: "static"
+    if (template != "static" && template != "ktor-htmx" && template != "ktor-incremental") {
+        throw ToolError("unknown template " + template + " (expected static, ktor-htmx or ktor-incremental)")
+    }
+    if (directory.exists() && directory.listFiles()?.isNotEmpty() == true) {
+        throw ToolError("directory is not empty: " + directory.absolutePath)
+    }
+    directory.mkdirs()
+    writeStarter(directory, template)
+    println("created " + template + " starter in " + directory.absolutePath)
+    println("next: cd " + directory.name + " && gradle run")
+}
+
+private const val KAIROS_VERSION = "0.1.0"
+private const val KOTLIN_VERSION = "2.2.20"
+
+private fun writeStarter(directory: File, template: String) {
+    val resources = listOf(
+        "settings.gradle.kts",
+        "build.gradle.kts",
+        "README.md",
+        "src/main/kotlin/Main.kt",
+    )
+    resources.forEach { relative ->
+        val stream = Thread.currentThread().contextClassLoader
+            .getResourceAsStream("templates/" + template + "/" + relative)
+            ?: throw ToolError("starter template is missing: " + relative)
+        val content = stream.bufferedReader().use { it.readText() }
+            .replace("__KAIROS__", KAIROS_VERSION)
+            .replace("__KOTLIN__", KOTLIN_VERSION)
+        val file = File(directory, relative)
+        file.parentFile.mkdirs()
+        file.writeText(content)
+    }
+}
+
+private fun checkProject(options: Options) {
+    val mapFile = File(options.requireSingle("map"))
+    val cssFile = File(options.requireSingle("css"))
+    if (!mapFile.exists()) throw ToolError("map not found: " + mapFile)
+    if (!cssFile.exists()) throw ToolError("css not found: " + cssFile)
+    val model = loadMap(mapFile.absolutePath)
+    val css = cssFile.readText()
+    val problems = ArrayList<String>()
+
+    val cssClasses = Regex("\\.(k[robv][0-9a-f]{12})").findAll(css).map { it.groupValues[1] }.toSet()
+    val mapClasses = model.rules.map { it.className }.toSet()
+    model.rules.forEach { rule ->
+        if (rule.className !in cssClasses) {
+            problems += "manifest rule " + rule.className + " is missing from the stylesheet"
+        } else if (!css.contains("." + rule.className + pseudoSuffix(rule) + " {")) {
+            problems += "stylesheet selector for " + rule.className + " does not match its conditions"
+        }
+    }
+    cssClasses.filter { it !in mapClasses }.forEach { orphan ->
+        problems += "stylesheet class " + orphan + " is not in the manifest"
+    }
+    if (model.errors.isNotEmpty()) {
+        problems += "manifest records " + model.errors.size + " build error(s)"
+    }
+    val warnings = ArrayList<String>()
+    if (model.coverage.fallbackBlocks > 0) {
+        val message = "manifest records " + model.coverage.fallbackBlocks +
+            " fallback block(s) (runtime concatenation)"
+        if (options.single("strict") == "true") problems += message else warnings += message
+    }
+
+    if (problems.isEmpty()) {
+        println("check passed: " + model.rules.size + " rules, " + model.coverage.conditionalRules + " conditional")
+        warnings.forEach { println("  warn " + it) }
+        return
+    }
+    println("check failed: " + problems.size + " problem(s)")
+    problems.forEach { println("  - " + it) }
+    exitProcess(1)
+}
+
+private fun pseudoSuffix(rule: Rule): String = rule.conditions
+    .filter { it.kind == "pseudoClass" || it.kind == "pseudoElement" }
+    .joinToString("") { it.value }
+
+private fun doctor(options: Options) {
+    println("kairos doctor")
+    var warnings = 0
+    val javaVersion = Runtime.version().feature()
+    if (javaVersion >= 21) println("ok   java        " + System.getProperty("java.version"))
+    else {
+        println("warn java        " + System.getProperty("java.version") + " (21+ required)")
+        warnings++
+    }
+    val node = runCatching { executeCommand("node", "--version") }.getOrNull()
+    if (node != null) println("ok   node        " + node)
+    else {
+        println("warn node        not found (Kotlin/JS targets need Node)")
+        warnings++
+    }
+    val gradle = runCatching { executeCommand("gradle", "--version") }.getOrNull()?.lines()?.firstOrNull { it.contains("Gradle") }
+    if (gradle != null) println("ok   gradle      " + gradle.trim())
+    else {
+        println("warn gradle      not on PATH (use ./gradlew)")
+        warnings++
+    }
+    val mavenLocal = File(System.getProperty("user.home"), ".m2/repository/dev/kairos")
+    if (mavenLocal.exists()) println("ok   mavenLocal  " + mavenLocal.absolutePath)
+    else {
+        println("warn mavenLocal  no dev.kairos artifacts (run ./gradlew -PframeworkOnly=true publishToMavenLocal)")
+        warnings++
+    }
+    val map = options.single("map")?.let(::File)
+    if (map != null && map.exists()) {
+        val model = loadMap(map.absolutePath)
+        println("ok   manifest    " + model.module + " (" + model.rules.size + " rules)")
+    }
+    println(if (warnings == 0) "all checks passed" else warnings.toString() + " warning(s)")
+}
+
+private fun executeCommand(vararg command: String): String {
+    val process = ProcessBuilder(*command).redirectErrorStream(true).start()
+    val output = process.inputStream.bufferedReader().readText().trim()
+    process.waitFor()
+    return output
+}
+
+private fun coverage(options: Options) {
+    val model = loadMap(options.requireSingle("map"))
+    println("module          " + model.module)
+    println("rules           " + model.coverage.rules)
+    println("conditional     " + model.coverage.conditionalRules)
+    println("fallback blocks " + model.coverage.fallbackBlocks)
+    println("errors          " + model.errors.size)
+    val byKind = model.rules.flatMap { it.conditions }.groupingBy { it.kind }.eachCount().toSortedMap()
+    byKind.forEach { (kind, count) -> println("  " + kind.padEnd(14) + count) }
+    if (model.coverage.fallbackBlocks > 0) {
+        println()
+        println("warning: " + model.coverage.fallbackBlocks + " style call(s) fell back to runtime concatenation")
     }
 }

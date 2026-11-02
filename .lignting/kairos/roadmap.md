@@ -7,7 +7,7 @@
 ## 1. 一句话现状与目标
 <!-- owner: /lts 首建；之后由最近一次改动"下一步"的命令覆盖本行 -->
 
-**现状（截至 2026-10-30）**：大轮次见 §2；当前轮 P6·R1 见 §3；最近回填 P6·R1（2026-10-30）见 §4
+**现状（截至 2026-10-31）**：方向已按 1.0 路线修订（[plan-1.0.md](plan-1.0.md)）；M0 完成、M1 收尾中；大轮次见 §2；当前轮见 §3；回填见 §4
 **目标**：用"状态必须可穷举"这条约束，把数据驱动前端框架的静态产物做到极致——绝大部分 UI 由 HTML/CSS 直出，JS 只留事件与最小更新（[direction.md 第 1 节](../../direction.md#1-目标与非目标)）
 **待拍板**：见 [direction.md 第 5 节](../../direction.md#5-待决问题)；阶段归属见 [phases.md 第 4 节](phases.md#4-待决问题归属)
 
@@ -24,24 +24,25 @@
 | P4 | 验证信号 5 要求写出第二个项目且不改框架源码，第二个项目必然跨模块 | 第二个模块 + 合并 + 剪枝，接进构建 | ① 合并无重复无遗漏<br/>② 跨模块去重生效<br/>③ 剪枝生效且页面仍可交互 | [phases.md](phases.md) · [对话](phases.dialogue.md) |
 | P5 | P1–P4 的产物"能用"但三处结构性缺陷：类太多、DSL 不顺手、平台定位混淆；且响应式缺失 | 一套核心两个库（core/browser/htmx）、一个块一个合并类、属性式 DSL、Signal 响应式，并落到静态站点与 htmx 博客两个示例 | ① 合并类（类数 < 声明数）<br/>② JVM/JS 两路径类名逐字符一致<br/>③ Playwright 端到端 9 条 | [phases.md](phases.md) · [对话](phases.dialogue.md) |
 | P6 | P5 的合并类之间仍有重复声明；块内三元被一刀切禁止；博客只有骨架 | 声明提取（共享类 + 残差类）、块内三元折叠为选类名、Markdown 与全局亮暗主题 | ① 同层无重复声明<br/>② 三元产物为条件类名<br/>③ E2E 覆盖 Markdown 与主题持久化 | [phases.md](phases.md) · [对话](phases.dialogue.md) |
+| M0 | 原型定位与 1.0 生态目标冲突 | 修订 direction.md、ADR×5、公共 API/支持矩阵/非目标/版本契约 | 文档之间不再自相矛盾 | [plan-1.0.md](plan-1.0.md) · [docs/](../../docs/) |
+| M1 | 原型不可安装、不可复现、不可解释 | Gradle 插件、版本目录、发布、BOM、相对路径 manifest、clean-room consumer、测试与 CI | 插件按 ID 接入；mavenLocal + consumer；跨目录逐字节一致；CI 绿 | [plan-1.0.md](plan-1.0.md) |
 
 **边界变更**（只追加，不改历史）
 - 2026-10-30 新增 P5：架构重构（合并类 / 双库 / 响应式），由用户对类数量、DX 与平台划分的反馈驱动 → [L4 · 阶段划分与排序理由](phases.dialogue.md#l4--阶段划分与排序理由)
 - 2026-10-29 首建，四阶段沿用上游骨架、核心目的重写 → [L4 · 阶段划分与排序理由](phases.dialogue.md#l4--阶段划分与排序理由)
 
 ## 3. 当前轮
-> 派生自 [计划原文](phase-4/round-1.md) · 同步于 2026-10-29；冲突以计划原文为准
+> 派生自 [plan-1.0.md](plan-1.0.md) · 同步于 2026-10-31；冲突以计划原文为准
 
 <!-- owner: /ltp；整块替换，只保留最近一轮 -->
 
-**Phase 5 · R1**（[计划](phase-5/round-1.md) · [验收标准细化](phase-5/round-1.md#5-验收标准细化)）
+**M1 · 发布与构建底座**（[计划 §M1](plan-1.0.md)）
 
-- 核心目的：把"能用"升级为"用得下去"——更少的类、更顺手的 DSL、一套核心两个库，并补上响应式
-- 要做什么：模块重构；一个块一个合并类；块内禁止动态值；属性式 DSL；Signal/effect/computed；Ktor+SQLite+Jimmer 博客与 Kotlin/JS 前端；Playwright 验收
-- 明确不做：伪类/媒体查询原语、keyed diff、跨机器可复现映射
-- 验收：A13/A14（产物级）、B8（响应式）、E1–E9（真实浏览器）
-- 改动顺序：见计划 §4（模块 → 命名 → 插件 → DSL → 响应式 → 博客 → E2E）
-- 回滚：每步独立，模块可整体回退；无数据迁移
+- 核心目的：让 Kairos 可安装、可复现、可解释——不再是靠手工 `-Xplugin` 接线的原型
+- 已落地：Gradle Wrapper 9.7.1、根 build、版本目录、`kairos-gradle-plugin`（`dev.kairos` + marker）、maven-publish/BOM/mavenLocal、manifest 相对路径、合并 manifest、clean-room consumer、core 单元测试、CI
+- 待完成：compiler golden/negative 测试、CLI 测试、Maven Central 发布（需凭证）、跨浏览器验收
+- 验收：`node tools/verify.mjs --rebuild`（16 项）、`tools/consumer-check.mjs`（5 项）、`tools/repro-check.mjs`、`tools/e2e-ci.sh`
+- 回滚：构建改动按模块独立；发布坐标 0.1.0 可覆盖
 
 ## 4. 执行回填
 > 事实来源：各轮 report（未落盘时链 round 文档）· 同步于 2026-10-29 · 冲突以 report 为准 · 逐轮追加
@@ -58,6 +59,13 @@
 | P4·R1 | 第二个模块 demo-feature；CLI merge 去重合并；CLI prune 按产物剪枝；装配链接入 | `node tools/verify.mjs --rebuild` → **12/12**；`node tools/browser-check.mjs` → **7/7**；63 条模块规则 → 51 去重 → 50 落地 | merge 层序 bug；剪枝实际只删 1 条（规模小）；dev 验证在收尾补跑 | [report](phase-4/round-1.report.md) · [计划](phase-4/round-1.md) |
 | P5·R1 | 模块重构为 core/browser/htmx；合并类（一块一类）；属性式 DSL 与 String.text；Signal/effect/computed + DOM 绑定；Ktor+SQLite+Jimmer 博客后端与 Kotlin/JS 前端；Playwright E2E | `node tools/verify.mjs --rebuild` → **12/12**；`node tools/browser-check.mjs` → **8/8**；`node tools/e2e.mjs` → **9/9**；demo-web 49 条声明 → **18 个类**（原 47） | 移除块内条件值（与合并类不可兼得）；htmx 改为随包分发；Jimmer 一次成功无需回退 | [report](phase-5/round-1.report.md) · [计划](phase-5/round-1.md) |
 | P6·R1 | 声明提取（两遍扫描）；块内三元/when 枚举组合；Markdown 渲染器；CSS 变量主题 + 持久化；深链返回整页 | `node tools/verify.mjs --rebuild` → **14/14**；`browser-check` → **8/8**；`e2e` → **10/10** | 提取统一为"每种组合一组声明"；styles() 无法解析时不再报错；JVM 目标也挂插件；深链修复 | [report](phase-6/round-1.report.md) · [计划](phase-6/round-1.md) |
+| M0 | 生态化定位修订；5 份 ADR；4 份契约 | 118 条相对链接可解析；文档无 TODO | 上游 direction.md 只加修订章节，不删历史 | [plan](plan-1.0.md) · [docs](../../docs/) |
+| M1 | Gradle 插件 + 发布 + BOM + 相对路径 manifest + 合并 manifest + consumer + 测试 + CI | `verify` 17/17；`consumer-check` 5/5；`browser-check` 9/9；`style-browser-check` 5/5；`e2e` 10/10；`repro-check` 3/3；core 单测 + 插件 golden/negative 通过 | 用 mavenLocal 发布坐标替代 monorepo project 依赖；插件输出改 `build/kairos/<target>/<compilation>`；正式发布待凭证 | [plan](plan-1.0.md) |
+| M2 | 样式只有层与块内常量分支；没有伪类/media/container/supports；库样式靠手工 merge | 条件模型 v1、manifest v4、轴模型、shorthand 诊断、库样式资产、strict/coverage、错误码、级联契约 | `verify` 17/17、`style-browser-check` 5/5、`cascade-check` 5/5、`library-check` 5/5 | [plan](plan-1.0.md) · [ADR 0002](../../docs/adr/0002-style-condition-model.md) |
+| M3 | 客户端只有手工 byId + 全量重建；htmx swap 靠 revision signal 兜底 | owner/dispose/batch/resource、声明式 `data-kairos-mount` 挂载、htmx 重绑、keyed list | `runtime-check` 3/3、`e2e` 10/10（swap 后过滤仍生效）；blog 删除 revision signal | [plan](plan-1.0.md) · [ADR 0005](../../docs/adr/0005-ssr-enhancement-model.md) |
+| M4 | XSS/CSRF/CSP 完全没管；CLI 只有 why/report/merge/prune | 安全基线、CLI 工具链、benchmark 预算、starter 生成、axe 扫描 | `e2e` 17/17；`starter-check` 5/5；`a11y-check` 0 违规；benchmark 预算通过 | [plan](plan-1.0.md) · [security.md](../../docs/contracts/security.md) |
+| M5 | docs 只有契约与计划，没有教程；starter 只有骨架 | 自举文档站、三个 starter、guides、治理文档、status 页 | `docs-check` 5/5（含 status/guides/migration）、`starter-check` 5/5 | [plan](plan-1.0.md) · [status](../../docs/status.md) |
+| M6 | 没有 API 契约与发布清单 | `@ExperimentalKairosApi`、二进制兼容、发布门禁、治理文档、本地仓库发布验证 | `apiCheck` 通过；本地仓库 16 jars + plugin marker；治理文档落地 | [plan](plan-1.0.md) · [release.md](../../docs/contracts/release.md) · [governance.md](../../docs/contracts/governance.md) |
 
 > 影响后续轮次的问题：见各轮 report 第 4 节；跨轮最要紧的三条——① 插件产物必须声明为任务输出；② 条件值不能跨 scope 搬移；③ 剪枝对运行时拼接的类名无能为力。
 
@@ -104,3 +112,5 @@
 | phase-5/round-1.report.md | 权杖 | P5 执行汇报 | [打开](phase-5/round-1.report.md) |
 | phase-6/round-1.md | 星币 | P6 计划（提取 + 三元 + 博客） | [打开](phase-6/round-1.md) |
 | phase-6/round-1.report.md | 权杖 | P6 执行汇报 | [打开](phase-6/round-1.report.md) |
+| plan-1.0.md | 总计划 | M0–M6 的 1.0 路线与执行进度 | [打开](plan-1.0.md) |
+| ../../docs/ | 契约 | ADR 与公共契约 | [打开](../../docs/) |

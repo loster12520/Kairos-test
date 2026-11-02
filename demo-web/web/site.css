@@ -22,3 +22,10 @@ header > div {
 button + button {
   margin-left: 8px;
 }
+
+/* Unlayered third-party rule used by the cascade acceptance check. By CSS cascade rules an
+   unlayered rule beats every @layer, which is exactly the documented integration story: an app
+   can always override Kairos without fighting specificity. */
+#cascade-probe {
+  background-color: rgb(1, 2, 3);
+}

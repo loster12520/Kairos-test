@@ -1,8 +1,14 @@
 import dev.kairos.browser.bindClassName
+import dev.kairos.browser.bindKeyedChildren
 import dev.kairos.browser.bindText
 import dev.kairos.browser.byId
+import dev.kairos.browser.elementById
+import dev.kairos.browser.installModal
 import dev.kairos.browser.onClick
 import dev.kairos.reactive.signal
+import dev.kairos.render.el
+import dev.kairos.runtime.css
+import dev.kairos.runtime.padding
 import kotlinx.browser.document
 import kotlin.js.js
 
@@ -42,5 +48,33 @@ private fun wire() {
     }
     onClick(byId(DENSITY_TOGGLE)) {
         density.update { if (it == Density.Comfortable) Density.Compact else Density.Comfortable }
+    }
+
+    // Modal: focus in, Tab trap, Escape to close, focus restored to the trigger.
+    byId("modal-open")?.let { trigger ->
+        elementById("shortcuts-modal")?.let { modal ->
+            installModal(
+                trigger = trigger,
+                modal = modal,
+                hiddenClass = modalHiddenStyle,
+                initialFocus = "#modal-close",
+                closeSelector = "#modal-close",
+            )
+        }
+    }
+
+    // Keyed list: adding an item reuses the existing DOM nodes (focus/scroll survive).
+    byId("keyed-list")?.let { list ->
+        val itemStyle: String = css { padding("6px 10px") }
+        val items = signal(listOf("Alpha", "Beta"))
+        bindKeyedChildren(
+            container = list,
+            signal = items,
+            key = { it },
+            render = { label -> el("li") { style = itemStyle; label.text } },
+        )
+        onClick(byId("keyed-add")) {
+            items.update { current -> current + ("Item " + (current.size + 1)) }
+        }
     }
 }

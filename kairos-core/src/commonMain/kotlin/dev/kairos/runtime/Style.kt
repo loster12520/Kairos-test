@@ -1,5 +1,7 @@
 package dev.kairos.runtime
 
+import dev.kairos.ExperimentalKairosApi
+
 /** One CSS declaration: a single (property, value) pair. */
 data class Declaration(val property: String, val value: String)
 
@@ -14,6 +16,59 @@ enum class Layer(val letter: Char, val cssName: String) {
     Override('o', "kairos.override"),
 }
 
+/**
+ * A condition attached to a group of declarations: a pseudo class/element, or an at-rule
+ * (`@media`, `@container`, `@supports`).
+ *
+ * Conditions are part of the class identity. Two style blocks with the same declarations but a
+ * different `:hover` rule must not share a class, otherwise the stylesheet would apply the hover
+ * state to the wrong element.
+ */
+sealed interface StyleCondition {
+    /** Suffix appended to the class selector, e.g. `:hover` or `::before`. */
+    val selectorSuffix: String
+
+    /** At-rule that wraps the rule, e.g. `@media (max-width: 600px)`; null for pseudo conditions. */
+    val atRule: String?
+
+    /** Stable key used by the class name hash and the manifest. */
+    val key: String
+
+    data class PseudoClass(val name: String) : StyleCondition {
+        override val selectorSuffix: String get() = ":" + name
+        override val atRule: String? get() = null
+        override val key: String get() = "p:" + name
+    }
+
+    data class PseudoElement(val name: String) : StyleCondition {
+        override val selectorSuffix: String get() = "::" + name
+        override val atRule: String? get() = null
+        override val key: String get() = "e:" + name
+    }
+
+    data class Media(val query: String) : StyleCondition {
+        override val selectorSuffix: String get() = ""
+        override val atRule: String get() = "@media " + query
+        override val key: String get() = "m:" + query
+    }
+
+    data class Container(val query: String) : StyleCondition {
+        override val selectorSuffix: String get() = ""
+        override val atRule: String get() = "@container " + query
+        override val key: String get() = "c:" + query
+    }
+
+    data class Supports(val query: String) : StyleCondition {
+        override val selectorSuffix: String get() = ""
+        override val atRule: String get() = "@supports " + query
+        override val key: String get() = "s:" + query
+    }
+}
+
+/** A group of declarations together with the conditions they apply under. */
+@ExperimentalKairosApi
+data class StyleRule(val conditions: List<StyleCondition>, val declarations: List<Declaration>)
+
 /** Marker DSL scope used inside [css]. */
 @DslMarker
 annotation class KairosDsl
@@ -21,10 +76,17 @@ annotation class KairosDsl
 /**
  * Receives the declarations written inside a [css] block. A second declaration for the same
  * property replaces the first (last wins).
+ *
+ * Conditional groups are separate style rules: `hover { ... }` records a rule that only applies
+ * while the pointer is over the element. The runtime (and the compiler) turn every rule into one
+ * class, so a block with a base part and a hover part returns two class names.
  */
 @KairosDsl
-class StyleScope internal constructor() {
+class StyleScope internal constructor(
+    private val conditionStack: List<StyleCondition> = emptyList(),
+) {
     internal val declarations: LinkedHashMap<String, Declaration> = LinkedHashMap()
+    internal val rules: MutableList<StyleRule> = ArrayList()
 
     /** Record a raw declaration. Every typed helper funnels through here. */
     fun declaration(property: String, value: String) {
@@ -33,6 +95,53 @@ class StyleScope internal constructor() {
         if (cleanProperty.isEmpty() || cleanValue.isEmpty()) return
         requireValidCss(cleanProperty, cleanValue)
         declarations[cleanProperty] = Declaration(cleanProperty, cleanValue)
+    }
+
+    // -- interactive states ---------------------------------------------------
+
+    fun hover(block: StyleScope.() -> Unit) = conditional(StyleCondition.PseudoClass("hover"), block)
+
+    fun focus(block: StyleScope.() -> Unit) = conditional(StyleCondition.PseudoClass("focus"), block)
+
+    fun focusVisible(block: StyleScope.() -> Unit) =
+        conditional(StyleCondition.PseudoClass("focus-visible"), block)
+
+    fun active(block: StyleScope.() -> Unit) = conditional(StyleCondition.PseudoClass("active"), block)
+
+    fun disabled(block: StyleScope.() -> Unit) =
+        conditional(StyleCondition.PseudoClass("disabled"), block)
+
+    fun checked(block: StyleScope.() -> Unit) = conditional(StyleCondition.PseudoClass("checked"), block)
+
+    fun before(block: StyleScope.() -> Unit) = conditional(StyleCondition.PseudoElement("before"), block)
+
+    fun after(block: StyleScope.() -> Unit) = conditional(StyleCondition.PseudoElement("after"), block)
+
+    // -- at-rules -------------------------------------------------------------
+
+    fun media(query: String, block: StyleScope.() -> Unit) {
+        requireValidQuery("media", query)
+        conditional(StyleCondition.Media(query.trim()), block)
+    }
+
+    fun container(query: String, block: StyleScope.() -> Unit) {
+        requireValidQuery("container", query)
+        conditional(StyleCondition.Container(query.trim()), block)
+    }
+
+    fun supports(query: String, block: StyleScope.() -> Unit) {
+        requireValidQuery("supports", query)
+        conditional(StyleCondition.Supports(query.trim()), block)
+    }
+
+    private fun conditional(condition: StyleCondition, block: StyleScope.() -> Unit) {
+        val child = StyleScope(conditionStack + condition)
+        child.block()
+        val effective = conditionStack + condition
+        if (child.declarations.isNotEmpty()) {
+            rules += StyleRule(effective, child.declarations.values.toList())
+        }
+        rules += child.rules
     }
 }
 
@@ -46,11 +155,19 @@ internal fun requireValidCss(property: String, value: String) {
     require(forbidden.none { it in value }) { "invalid CSS value for " + property + ": " + value }
 }
 
+internal fun requireValidQuery(kind: String, query: String) {
+    val trimmed = query.trim()
+    require(trimmed.isNotEmpty()) { "empty " + kind + " query" }
+    val forbidden = charArrayOf(';', '{', '}', '\n', '\r')
+    require(forbidden.none { it in trimmed }) { "invalid " + kind + " query: " + query }
+}
+
 /**
  * Compile-time style block.
  *
- * The whole block becomes **one class** carrying every declaration, so the number of classes is
- * proportional to the number of style blocks rather than declarations.
+ * The base declarations become **one class** carrying every declaration, so the number of classes
+ * is proportional to the number of style blocks rather than declarations. Conditional groups
+ * (hover, media, ...) become one extra class each, with the condition baked into the class name.
  *
  * Every value must be a compile-time constant. A block whose value depends on runtime input is
  * a compile error: the class list has to be identical whether or not the compiler ran. Select a
@@ -66,11 +183,19 @@ internal fun requireValidCss(property: String, value: String) {
 fun css(layer: Layer = Layer.Base, block: StyleScope.() -> Unit): String {
     val scope = StyleScope()
     scope.block()
-    val ordered = scope.declarations.values.toList()
-    if (ordered.isEmpty()) return ""
-    val className = classNameFor(layer, ordered)
-    KairosRuntimeRegistry.record(className, layer, ordered)
-    return className
+    val classes = ArrayList<String>(1 + scope.rules.size)
+    val base = scope.declarations.values.toList()
+    if (base.isNotEmpty()) {
+        val className = classNameFor(layer, base)
+        KairosRuntimeRegistry.record(className, layer, base)
+        classes += className
+    }
+    scope.rules.forEach { rule ->
+        val className = classNameFor(layer, rule.declarations, rule.conditions)
+        KairosRuntimeRegistry.record(className, layer, rule.declarations, rule.conditions)
+        classes += className
+    }
+    return classes.distinct().joinToString(" ")
 }
 
 /**
@@ -89,12 +214,22 @@ fun styles(vararg blocks: String): String {
  * Deterministic class name for a group of declarations. Declarations are sorted by property so
  * the caller's order never leaks into the name; the layer is part of the hash so the same
  * declarations in another layer are another class.
+ *
+ * With no conditions the hash input is exactly the v1 input, so existing class names never
+ * change when a project starts using conditional rules.
  */
-fun classNameFor(layer: Layer, declarations: List<Declaration>): String {
+@ExperimentalKairosApi
+fun classNameFor(
+    layer: Layer,
+    declarations: List<Declaration>,
+    conditions: List<StyleCondition> = emptyList(),
+): String {
     val canonical = declarations.sortedBy { it.property }.joinToString(";") { it.property + ":" + it.value }
-    return "k" + layer.letter + fnv1a64Hex(layer.cssName + "#" + canonical).take(12)
+    val conditionKey = if (conditions.isEmpty()) "" else "#c:" + conditions.joinToString(";") { it.key }
+    return "k" + layer.letter + fnv1a64Hex(layer.cssName + "#" + canonical + conditionKey).take(12)
 }
 
+@ExperimentalKairosApi
 fun classNameFor(layer: Layer, declaration: Declaration): String = classNameFor(layer, listOf(declaration))
 
 internal fun fnv1a64Hex(input: String): String {
@@ -113,17 +248,32 @@ internal fun fnv1a64Hex(input: String): String {
 
 /** Dev-only registry of the styles that reached the runtime instead of being folded. */
 object KairosRuntimeRegistry {
-    private val entries = LinkedHashMap<String, Pair<Layer, List<Declaration>>>()
+    private data class Entry(
+        val layer: Layer,
+        val declarations: List<Declaration>,
+        val conditions: List<StyleCondition>,
+    )
 
-    fun record(className: String, layer: Layer, declarations: List<Declaration>) {
-        if (!entries.containsKey(className)) entries[className] = layer to declarations
+    private val entries = LinkedHashMap<String, Entry>()
+
+    fun record(
+        className: String,
+        layer: Layer,
+        declarations: List<Declaration>,
+        conditions: List<StyleCondition> = emptyList(),
+    ) {
+        if (!entries.containsKey(className)) entries[className] = Entry(layer, declarations, conditions)
     }
 
     fun snapshot(): Map<String, Pair<Layer, List<Declaration>>> {
         val out = LinkedHashMap<String, Pair<Layer, List<Declaration>>>()
-        entries.keys.sorted().forEach { out[it] = entries.getValue(it) }
+        entries.keys.sorted().forEach { out[it] = entries.getValue(it).layer to entries.getValue(it).declarations }
         return out
     }
+
+    /** Condition list per class, for tooling that inspects the fallback path. */
+    fun conditions(): Map<String, List<StyleCondition>> =
+        entries.keys.sorted().associateWith { entries.getValue(it).conditions }
 
     fun size(): Int = entries.size
 
@@ -182,6 +332,7 @@ inline fun StyleScope.fontWeight(value: String) = declaration("font-weight", val
 inline fun StyleScope.lineHeight(value: String) = declaration("line-height", value)
 inline fun StyleScope.letterSpacing(value: String) = declaration("letter-spacing", value)
 inline fun StyleScope.border(value: String) = declaration("border", value)
+inline fun StyleScope.borderColor(value: String) = declaration("border-color", value)
 inline fun StyleScope.borderTop(value: String) = declaration("border-top", value)
 inline fun StyleScope.borderBottom(value: String) = declaration("border-bottom", value)
 inline fun StyleScope.borderRadius(value: String) = declaration("border-radius", value)
@@ -197,3 +348,4 @@ inline fun StyleScope.gridTemplateColumns(value: String) = declaration("grid-tem
 inline fun StyleScope.overflow(value: String) = declaration("overflow", value)
 inline fun StyleScope.whiteSpace(value: String) = declaration("white-space", value)
 inline fun StyleScope.listStyle(value: String) = declaration("list-style", value)
+inline fun StyleScope.content(value: String) = declaration("content", value)

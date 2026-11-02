@@ -31,6 +31,7 @@ console.log('');
 const browser = await chromium.launch();
 const page = await browser.newPage();
 const pageErrors = [];
+page.on('dialog', (dialog) => dialog.accept());
 page.on('pageerror', (error) => pageErrors.push(String(error)));
 page.on('console', (message) => { if (message.type() === 'error') pageErrors.push(message.text()); });
 
@@ -144,6 +145,142 @@ await check('E10', 'post bodies are rendered as markdown', async () => {
   assert(html.includes('<strong>'), 'no bold text in the rendered body');
   assert(html.includes('<ul>'), 'no list in the rendered body');
   return 'bold + list rendered';
+});
+
+await check('E14', 'untrusted comment markup is escaped and unsafe links are dropped', async () => {
+  const marker = 'xss ' + Date.now();
+  await page.locator('#comments input[name="author"]').fill('xss');
+  await page
+    .locator('#comments textarea[name="body"]')
+    .fill('<script>window.__kairosXss = 1</script> [click](javascript:alert(1)) ' + marker);
+  await page.locator('#comments button[type="submit"]').click();
+  await page.waitForFunction(
+    (text) => document.querySelector('#comments')?.textContent.includes(text),
+    marker,
+    { timeout: 8000 },
+  );
+  const executed = await page.evaluate(() => window.__kairosXss);
+  assert(executed === undefined, 'inline script executed: ' + executed);
+  const html = await page.locator('#comments').innerHTML();
+  assert(!/<script>window\.__kairosXss/.test(html), 'raw script tag leaked into the comment html');
+  assert(!/href="javascript:/i.test(html), 'javascript: link leaked into the comment html');
+  assert(html.includes('click'), 'link label should survive as text');
+  return 'script escaped, javascript: link dropped';
+});
+
+await check('E15', 'strict security headers are sent with the page', async () => {
+  const response = await page.request.get(BASE + '/');
+  const csp = response.headers()['content-security-policy'] || '';
+  assert(csp.includes("script-src 'self'"), 'missing strict script-src: ' + csp);
+  assert(!/script-src[^;]*unsafe-inline/.test(csp), 'script-src allows inline scripts: ' + csp);
+  assert(csp.includes("frame-ancestors 'none'"), 'missing frame-ancestors: ' + csp);
+  assert(response.headers()['x-content-type-options'] === 'nosniff', 'missing nosniff header');
+  return csp.slice(0, 80) + '...';
+});
+
+await check('E16', 'a mutating request without the csrf token is rejected', async () => {
+  const response = await page.request.post(BASE + '/posts', {
+    form: { title: 'csrf probe', body: 'csrf probe' },
+  });
+  assert(response.status() === 403, 'expected 403 without a csrf token, got ' + response.status());
+  return '403 without csrf token';
+});
+
+await check('E17', 'keyboard users can open a post and focus follows the fragment', async () => {
+  await page.locator('#post-list [data-title] a').first().focus();
+  await page.keyboard.press('Enter');
+  await page.waitForSelector('#detail-title', { timeout: 8000 });
+  await page.waitForTimeout(150);
+  const focused = await page.evaluate(() => document.activeElement?.id);
+  assert(focused === 'detail-title', 'focus landed on ' + focused);
+  return 'Enter opened the post, focus on #detail-title';
+});
+
+await check('E18', 'the comments region announces updates to assistive technology', async () => {
+  const live = await page.locator('#comments').evaluate((element) => ({
+    role: element.getAttribute('role'),
+    live: element.getAttribute('aria-live'),
+  }));
+  assert(live.role === 'status', 'comments role is ' + live.role);
+  assert(live.live === 'polite', 'comments aria-live is ' + live.live);
+  return 'role=status aria-live=polite';
+});
+
+await check('E19', 'invalid form input is re-rendered with an error and the entered values', async () => {
+  const token = await page.locator('input[name="_csrf"]').first().getAttribute('value');
+  assert(token, 'no csrf token on the page');
+  const response = await page.request.post(BASE + '/posts', {
+    form: { title: 'kept title', body: '', _csrf: token },
+  });
+  assert(response.status() === 200, 'expected a re-rendered form, got ' + response.status());
+  const html = await response.text();
+  assert(html.includes('new-post-form'), 'the form was not re-rendered');
+  assert(html.includes('title and body are required'), 'the error message is missing');
+  assert(html.includes('kept title'), 'the entered title was not preserved');
+  return 'error + entered value preserved';
+});
+
+await check('E20', 'invalid comment input is re-rendered with an error', async () => {
+  const token = await page.locator('input[name="_csrf"]').first().getAttribute('value');
+  const postId = await page.evaluate(() => {
+    const form = document.querySelector('#comments form[hx-post]');
+    if (!form) return null;
+    const match = (form.getAttribute('hx-post') || '').match(/\/posts\/(\d+)\/comments/);
+    return match ? match[1] : null;
+  });
+  assert(postId, 'no open post to comment on');
+  const response = await page.request.post(BASE + '/posts/' + postId + '/comments', {
+    form: { author: 'reader', body: '', _csrf: token },
+  });
+  const html = await response.text();
+  assert(html.includes('comment is required'), 'the error message is missing');
+  assert(html.includes('reader'), 'the author value was not preserved');
+  return 'comment error + author preserved';
+});
+
+await check('E21', 'editing a post updates the detail and the list in place', async () => {
+  await page.locator('#post-list [data-title] a').first().click();
+  await page.waitForSelector('#detail-title', { timeout: 8000 });
+  await page.locator('#detail button:has-text("Edit post")').click();
+  await page.waitForSelector('#edit-post-form', { timeout: 8000 });
+  const title = 'Edited ' + Date.now();
+  await page.locator('#edit-post-form input[name="title"]').fill(title);
+  await page.locator('#edit-post-form button[type="submit"]').click();
+  await page.waitForFunction(
+    (text) => document.querySelector('#detail-title')?.textContent.includes(text),
+    title,
+    { timeout: 8000 },
+  );
+  const listTitles = await page.locator('#post-list [data-title]').evaluateAll((nodes) =>
+    nodes.map((node) => node.textContent || ''),
+  );
+  assert(listTitles.some((text) => text.includes(title)), 'the list did not update after edit');
+  return title;
+});
+
+await check('E22', 'deleting a post removes it from the list', async () => {
+  const before = await page.locator('#post-list [data-title]').count();
+  await page.locator('#post-list [data-title]').first().locator('button:has-text("Delete")').click();
+  await page.waitForFunction(
+    (count) => document.querySelectorAll('#post-list [data-title]').length === count,
+    before - 1,
+    { timeout: 8000 },
+  );
+  return before + ' -> ' + (before - 1);
+});
+
+await check('E23', 'sorting by comments reorders the list', async () => {
+  await page.locator('button:has-text("Most comments")').click();
+  await page.waitForTimeout(250);
+  const counts = await page.locator('#post-list [data-title]').evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const match = (node.textContent || '').match(/(\d+) comments/);
+      return match ? Number(match[1]) : 0;
+    }),
+  );
+  const sorted = [...counts].sort((left, right) => right - left);
+  assert(JSON.stringify(counts) === JSON.stringify(sorted), 'list is not sorted by comments: ' + counts.join(','));
+  return counts.join(', ');
 });
 
 await check('E9', 'the page produced no console or script errors', async () => {

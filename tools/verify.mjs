@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
 import { execFileSync, execSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DEMO = join(ROOT, 'demo-web');
-const KAIROS_OUT = join(DEMO, 'build', 'kairos');
+const KAIROS_OUT = join(DEMO, 'build', 'kairos', 'js', 'main');
 const JS_OUT = join(DEMO, 'build', 'compileSync', 'js', 'main', 'productionExecutable', 'kotlin');
 const SITE = join(DEMO, 'build', 'site');
 
@@ -52,14 +52,33 @@ const LAYERS = {
   Variant: { letter: 'v', css: 'kairos.variant', index: 2 },
   Override: { letter: 'o', css: 'kairos.override', index: 3 },
 };
-function classNameFor(layerName, declarations) {
+function conditionKey(condition) {
+  const prefixes = { pseudoClass: 'p:', pseudoElement: 'e:', media: 'm:', container: 'c:', supports: 's:' };
+  const value = condition.value;
+  if (condition.kind === 'pseudoClass') return 'p:' + value.replace(/^:/, '');
+  if (condition.kind === 'pseudoElement') return 'e:' + value.replace(/^::/, '');
+  return prefixes[condition.kind] + value;
+}
+function classNameFor(layerName, declarations, conditions = []) {
   const layer = LAYERS[layerName];
   const canonical = declarations
     .map((d) => [d.property, d.value])
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .map((d) => d[0] + ':' + d[1])
     .join(';');
-  return 'k' + layer.letter + fnv1a64Hex(layer.css + '#' + canonical).slice(0, 12);
+  const conditionSuffix = conditions.length === 0 ? '' : '#c:' + conditions.map(conditionKey).join(';');
+  return 'k' + layer.letter + fnv1a64Hex(layer.css + '#' + canonical + conditionSuffix).slice(0, 12);
+}
+function selectorFor(rule) {
+  const suffix = (rule.conditions || [])
+    .filter((c) => c.kind === 'pseudoClass' || c.kind === 'pseudoElement')
+    .map((c) => c.value)
+    .join('');
+  return '.' + rule.className + suffix;
+}
+const RULE_RE = /\.k[robv][0-9a-f]{12}(?:::[a-z-]+|:[a-z-]+)? \{/g;
+function cssRuleClasses(cssText) {
+  return [...cssText.matchAll(RULE_RE)].map((m) => /k[robv][0-9a-f]{12}/.exec(m[0])[0]);
 }
 const decl = (property, value) => ({ property, value });
 
@@ -94,15 +113,17 @@ let determinism = null;
 let artifactRegeneration = null;
 if (REBUILD) {
   rmSync(KAIROS_OUT, { recursive: true, force: true });
-  execSync('gradle :demo-web:compileProductionExecutableKotlinJs --console=plain -q', { cwd: ROOT, stdio: 'pipe' });
+  execSync('./gradlew :demo-web:compileProductionExecutableKotlinJs --console=plain -q', { cwd: ROOT, stdio: 'pipe' });
   artifactRegeneration = existsSync(cssPath) && existsSync(mapPath);
   const buildOnce = () => {
     rmSync(KAIROS_OUT, { recursive: true, force: true });
-    execSync('gradle :demo-web:compileProductionExecutableKotlinJs --console=plain -q --rerun-tasks', { cwd: ROOT, stdio: 'pipe' });
+    execSync('./gradlew :demo-web:compileProductionExecutableKotlinJs --console=plain -q --rerun-tasks', { cwd: ROOT, stdio: 'pipe' });
     if (!existsSync(cssPath) || !existsSync(mapPath)) throw new Error('build produced no kairos artifacts');
     return { css: sha256(cssPath), map: sha256(mapPath) };
   };
   determinism = { first: buildOnce(), second: buildOnce() };
+  // Refresh the assembled site so A14/A15 read artifacts produced by the current CLI.
+  execSync('./gradlew :demo-web:assembleSite --console=plain -q', { cwd: ROOT, stdio: 'pipe' });
 }
 
 console.log('Kairos acceptance harness');
@@ -135,7 +156,7 @@ check('A2', 'class names are reproducible from layer + declarations (independent
   for (const rule of map.rules) {
     const layerName = Object.keys(LAYERS).find((k) => LAYERS[k].css === rule.layer);
     assert(layerName, 'unknown layer ' + rule.layer);
-    assert(rule.className === classNameFor(layerName, rule.declarations), 'mismatch for ' + rule.className);
+    assert(rule.className === classNameFor(layerName, rule.declarations, rule.conditions || []), 'mismatch for ' + rule.className);
   }
   return map.rules.length + ' classes recomputed identically';
 });
@@ -145,7 +166,8 @@ check('A3', 'no declaration is emitted twice: blocks are grouped and shared decl
   const seen = new Map();
   for (const rule of map.rules) {
     for (const d of rule.declarations) {
-      const key = rule.layer + '|' + d.property + ':' + d.value;
+      const conditionSignature = (rule.conditions || []).map(conditionKey).join(',');
+      const key = rule.layer + '|' + conditionSignature + '|' + d.property + ':' + d.value;
       assert(!seen.has(key), 'declaration emitted twice: ' + d.property + ': ' + d.value + ' in ' + rule.className + ' and ' + seen.get(key));
       seen.set(key, rule.className);
     }
@@ -167,7 +189,27 @@ check('A13', 'a ternary inside a style block compiles to a class selection, not 
   return 'badge=' + run.badge;
 });
 
-check('A4', 'the all-runtime path (JVM, no plugin) and the all-folded path agree exactly', () => {
+check('A16', 'conditional rules (pseudo classes, pseudo elements, media, container, supports) ship in css and manifest', () => {
+  const conditions = map.rules.flatMap((rule) => rule.conditions || []);
+  const kinds = new Set(conditions.map((condition) => condition.kind));
+  for (const kind of ['pseudoClass', 'pseudoElement', 'media', 'container', 'supports']) {
+    assert(kinds.has(kind), 'manifest has no ' + kind + ' rule');
+  }
+  const cssText = readFileSync(cssPath, 'utf8');
+  assert(/:hover \{/.test(cssText), 'css has no :hover rule');
+  assert(/::before \{/.test(cssText), 'css has no ::before rule');
+  assert(/@media \(/.test(cssText), 'css has no @media block');
+  assert(/@container /.test(cssText), 'css has no @container block');
+  assert(/@supports \(/.test(cssText), 'css has no @supports block');
+  const conditionalRules = map.rules.filter((rule) => (rule.conditions || []).length > 0);
+  const baseRules = map.rules.filter((rule) => (rule.conditions || []).length === 0);
+  for (const rule of conditionalRules) {
+    assert(selectorFor(rule).includes(':' ) || rule.conditions.some((c) => c.kind !== 'pseudoClass' && c.kind !== 'pseudoElement'), 'conditional rule lost its condition: ' + rule.className);
+  }
+  return conditionalRules.length + ' conditional / ' + baseRules.length + ' base rules';
+});
+
+check('A4', 'the JVM static render and the JS bundle agree exactly', () => {
   assert(existsSync(referencePath), 'missing JVM reference output');
   const reference = readPairs(referencePath);
   assert(reference.hero === run.hero, 'hero differs: jvm=' + reference.hero + ' js=' + run.hero);
@@ -177,17 +219,17 @@ check('A4', 'the all-runtime path (JVM, no plugin) and the all-folded path agree
 });
 
 check('A5', 'emitted CSS contains exactly the classes of the map, grouped by layer', () => {
-  const ruleCount = (css.match(/^  \.[a-z0-9]+ \{/gm) || []).length;
-  assert(ruleCount === map.rules.length, 'css has ' + ruleCount + ' rules, map has ' + map.rules.length);
+  const selectors = cssRuleClasses(css);
+  assert(selectors.length === map.rules.length, 'css has ' + selectors.length + ' rules, map has ' + map.rules.length);
   for (const rule of map.rules) {
-    assert(css.includes('.' + rule.className + ' {'), 'missing rule for ' + rule.className);
+    assert(css.includes(selectorFor(rule) + ' {'), 'missing rule for ' + selectorFor(rule));
     for (const d of rule.declarations) {
       assert(css.includes(d.property + ': ' + d.value + ';'), 'rule ' + rule.className + ' lacks ' + d.property);
     }
   }
   const blocks = ['kairos.reset', 'kairos.base', 'kairos.variant', 'kairos.override'].map((n) => css.indexOf('@layer ' + n + ' {'));
   for (let i = 1; i < blocks.length; i++) assert(blocks[i] > blocks[i - 1], 'layer blocks out of order');
-  return ruleCount + ' rules, 4 layer blocks in priority order';
+  return selectors.length + ' rules, 4 layer blocks in priority order';
 });
 
 check('A6', 'cross layer conflicts are detected and recorded', () => {
@@ -202,7 +244,7 @@ check('A7', 'composition keeps both classes; the winning layer is later', () => 
   const html = readFileSync(join(SITE, 'index.html'), 'utf8');
   const border = map.conflicts.find((c) => c.property === 'border' && c.winnerLayer === 'kairos.override');
   const baseClass = map.rules.find((r) => r.layer === 'kairos.base' && r.declarations.some((d) => d.property === 'border' && d.value === border.loserValue));
-  const overrideClass = map.rules.find((r) => r.layer === 'kairos.override');
+  const overrideClass = map.rules.find((r) => r.layer === 'kairos.override' && r.declarations.some((d) => d.property === 'border'));
   assert(baseClass && overrideClass, 'missing one side of the conflict');
   const classLists = [...html.matchAll(/class="([^"]*)"/g)].map((m) => m[1].split(/\s+/));
   const withBoth = classLists.filter((list) => list.includes(baseClass.className) && list.includes(overrideClass.className));
@@ -221,24 +263,24 @@ check('A8', 'no style block silently failed to resolve', () => {
 check('A9', 'the merged site stylesheet is deduplicated, complete and correctly layered', () => {
   const siteCss = readFileSync(join(SITE, 'kairos.css'), 'utf8');
   const html = readFileSync(join(SITE, 'index.html'), 'utf8');
-  const selectors = [...siteCss.matchAll(/^  \.([a-z0-9]+) \{/gm)].map((m) => m[1]);
+  const selectors = cssRuleClasses(siteCss);
   assert(selectors.filter((n, i) => selectors.indexOf(n) !== i).length === 0, 'duplicate selectors after merge');
   const blocks = ['kairos.reset', 'kairos.base', 'kairos.variant', 'kairos.override'].map((n) => siteCss.indexOf('@layer ' + n + ' {'));
   for (let i = 1; i < blocks.length; i++) assert(blocks[i] > blocks[i - 1], 'merged layer blocks out of order');
   const used = new Set([...html.matchAll(/class="([^"]*)"/g)].flatMap((m) => m[1].split(/\s+/)).filter(Boolean));
-  const missing = [...used].filter((name) => !siteCss.includes('.' + name + ' '));
+  const missing = [...used].filter((name) => !siteCss.includes('.' + name));
   assert(missing.length === 0, 'page uses classes missing from the merged stylesheet: ' + missing.join(', '));
   return selectors.length + ' classes, no duplicates, ' + used.size + ' page classes all present';
 });
 
 check('A10', 'module maps merge with cross-module deduplication and unused rules are pruned', () => {
-  const featureMapPath = join(ROOT, 'demo-web-feature', 'build', 'kairos', 'kairos.map.json');
+  const featureMapPath = join(ROOT, 'demo-web-feature', 'build', 'kairos', 'js', 'main', 'kairos.map.json');
   assert(existsSync(featureMapPath), 'missing second module map');
   const featureMap = JSON.parse(readFileSync(featureMapPath, 'utf8'));
   const total = map.rules.length + featureMap.rules.length;
   const union = new Set([...map.rules, ...featureMap.rules].map((r) => r.className));
   const siteCss = readFileSync(join(SITE, 'kairos.css'), 'utf8');
-  const shipped = new Set([...siteCss.matchAll(/^  \.([a-z0-9]+) \{/gm)].map((m) => m[1]));
+  const shipped = new Set(cssRuleClasses(siteCss));
   assert(shipped.size <= union.size, 'merged stylesheet has more classes than the union');
   assert(map.module === 'demo-web', 'first map has module name ' + map.module);
   assert(featureMap.module === 'demo-web-feature', 'second map has module name ' + featureMap.module);
@@ -256,6 +298,50 @@ check('A12', 'two forced rebuilds produce byte-identical css and map', () => {
   assert(determinism.first.css === determinism.second.css, 'css drifted');
   assert(determinism.first.map === determinism.second.map, 'map drifted');
   return 'css ' + determinism.first.css.slice(0, 16) + '... stable';
+});
+
+check('A14', 'the merged manifest matches the shipped stylesheet and modules', () => {
+  const mergedMap = JSON.parse(readFileSync(join(SITE, 'kairos.map.json'), 'utf8'));
+  const siteCss = readFileSync(join(SITE, 'kairos.css'), 'utf8');
+  const cssClasses = cssRuleClasses(siteCss).sort();
+  const mapClasses = mergedMap.rules.map((rule) => rule.className).sort();
+  assert(JSON.stringify(cssClasses) === JSON.stringify(mapClasses), 'manifest rules do not match the shipped css');
+  assert(mergedMap.modules.includes('demo-web'), 'merged manifest lost the demo-web module');
+  assert(mergedMap.modules.includes('demo-web-feature'), 'merged manifest lost the feature module');
+  for (const rule of mergedMap.rules) {
+    for (const source of rule.sources) {
+      assert(!source.file.startsWith('/'), 'absolute source path after merge: ' + source.file);
+    }
+  }
+  return netSummary(cssClasses.length);
+});
+
+function netSummary(count) {
+  return count + ' rules, modules ' + ['demo-web', 'demo-web-feature'].join(' + ');
+}
+
+check('A15', 'editing a style declaration reaches the manifest through an incremental build', () => {
+  const source = join(DEMO, 'src', 'commonMain', 'kotlin', 'Site.kt');
+  const original = readFileSync(source, 'utf8');
+  const target = 'color("#5b6071")';
+  const occurrences = original.split(target).length - 1;
+  assert(occurrences === 1, 'expected one ' + target + ' declaration, found ' + occurrences);
+  const changed = original.replace(target, 'color("#5b6072")');
+  try {
+    writeFileSync(source, changed);
+    execSync('./gradlew :demo-web:compileKotlinJs --console=plain -q', { cwd: ROOT, stdio: 'pipe' });
+    const incremental = JSON.parse(readFileSync(mapPath, 'utf8'));
+    const values = incremental.rules.flatMap((rule) => rule.declarations.map((d) => d.value));
+    assert(values.includes('#5b6072'), 'incremental build did not pick up the edited value');
+    assert(!values.includes('#5b6071'), 'incremental build kept the stale value');
+  } finally {
+    writeFileSync(source, original);
+    execSync('./gradlew :demo-web:compileKotlinJs --console=plain -q', { cwd: ROOT, stdio: 'pipe' });
+  }
+  const restored = JSON.parse(readFileSync(mapPath, 'utf8'));
+  const restoredValues = restored.rules.flatMap((rule) => rule.declarations.map((d) => d.value));
+  assert(restoredValues.includes('#5b6071'), 'restoring the source did not restore the artifact');
+  return 'edited value reached kairos.map.json and was restored';
 });
 
 const failed = results.filter((r) => !r.ok);

@@ -53,6 +53,8 @@ class Signal<T> internal constructor(initial: T) {
         val previous = value
         value = next
         if (previous == next) return
+        // Observer callbacks route through [Batching], which deduplicates per effect inside a
+        // batch. Outside a batch the effect runs immediately, exactly as before.
         observers.toList().forEach { it(next) }
     }
 }
@@ -60,31 +62,73 @@ class Signal<T> internal constructor(initial: T) {
 /** Creates a reactive value. */
 fun <T> signal(initial: T): Signal<T> = Signal(initial)
 
+/** Root owner that keeps module level [computed] effects alive for the lifetime of the app. */
+private val rootOwner = Owner()
+
 /**
  * A derived value. [block] runs again whenever a signal it read changes, and its own value only
  * notifies downstream observers when the computed result actually differs.
+ *
+ * The recomputation effect is owned by the root owner: computed values are module scoped and live
+ * as long as the application does. Scoped computations should use [Owner.computed] instead.
  */
-fun <T> computed(block: () -> T): Signal<T> {
-    val initial = block()
-    val result = Signal(initial)
-    effect {
-        val next = block()
-        if (next != result.peek()) result.setAndNotify(next)
-    }
-    return result
-}
+fun <T> computed(block: () -> T): Signal<T> = rootOwner.computed(block)
 
-/** A side effect that re-runs when the signals it read change. */
-fun effect(block: () -> Unit): Disposable {
-    val effect = Effect(block)
-    effect.run()
-    return effect
+/** A side effect that re-runs when the signals it read change; owned by the module root. */
+fun effect(block: () -> Unit): Disposable = Effect(block).also { it.run() }
+
+/**
+ * Coalesces writes: every effect queued inside the block runs once after the outermost block
+ * exits, so ten signals written together still produce one DOM update per effect.
+ */
+object Batching {
+    private var depth = 0
+    private val queue = LinkedHashSet<Effect>()
+
+    fun batch(block: () -> Unit) {
+        depth += 1
+        try {
+            block()
+        } finally {
+            depth -= 1
+            if (depth == 0) flush()
+        }
+    }
+
+    /** Queues [effect] once per batch; effects are deduplicated by identity. */
+    internal fun schedule(effect: Effect) {
+        if (depth == 0) {
+            effect.run()
+        } else {
+            queue += effect
+        }
+    }
+
+    internal fun isBatching(): Boolean = depth > 0
+
+    private fun flush() {
+        while (queue.isNotEmpty()) {
+            val pending = queue.toList()
+            queue.clear()
+            pending.forEach { effect ->
+                try {
+                    effect.run()
+                } catch (failure: Throwable) {
+                    Reactivity.reportError(failure)
+                }
+            }
+        }
+    }
 }
 
 /** Stops an effect from re-running and detaches every subscription it made. */
 class Effect internal constructor(private val block: () -> Unit) : Disposable {
 
     private val dependencies = ArrayList<Signal<*>>()
+
+    init {
+        Reactivity.recordEffectCreated()
+    }
     private var subscriptions = ArrayList<Disposable>()
     private var disposed = false
 
@@ -93,9 +137,15 @@ class Effect internal constructor(private val block: () -> Unit) : Disposable {
         subscriptions.forEach { it.dispose() }
         subscriptions = ArrayList()
         dependencies.clear()
-        Reactivity.withTracking(this) { block() }
+        // Exceptions are isolated: one broken effect must not stop the rest of the page, and it
+        // must not lose its subscriptions (otherwise it could never recover).
+        try {
+            Reactivity.withTracking(this) { block() }
+        } catch (failure: Throwable) {
+            Reactivity.reportError(failure)
+        }
         dependencies.forEach { signal ->
-            subscriptions += signal.observe { run() }
+            subscriptions += signal.observe { Batching.schedule(this) }
         }
     }
 
@@ -104,7 +154,9 @@ class Effect internal constructor(private val block: () -> Unit) : Disposable {
     }
 
     override fun dispose() {
+        if (disposed) return
         disposed = true
+        Reactivity.recordEffectDisposed()
         subscriptions.forEach { it.dispose() }
         subscriptions = ArrayList()
         dependencies.clear()
@@ -114,8 +166,14 @@ class Effect internal constructor(private val block: () -> Unit) : Disposable {
 /** Keeps track of the effect currently being evaluated. */
 object Reactivity {
     private var active: Effect? = null
+    private var errorHandler: (Throwable) -> Unit = { failure ->
+        println("[kairos] reactive error: " + (failure.message ?: failure::class.simpleName))
+    }
 
-    internal fun track(signal: Signal<*>) {
+    var effectCount: Int = 0
+        private set
+
+    fun track(signal: Signal<*>) {
         active?.dependOn(signal)
     }
 
@@ -128,13 +186,27 @@ object Reactivity {
             active = previous
         }
     }
-}
 
-/**
- * Convenience for the common "exhaustive mode" case: maps a signal through a function that the
- * compiler can fold, so each state is still a static class name.
- */
-fun <T> Signal<T>.map(transform: (T) -> String): Signal<String> {
-    val source = this
-    return computed { transform(source.current) }
+    /** Installs the sink for exceptions thrown by effects; returns the previous handler. */
+    fun onError(handler: (Throwable) -> Unit): (Throwable) -> Unit {
+        val previous = errorHandler
+        errorHandler = handler
+        return previous
+    }
+
+    internal fun reportError(failure: Throwable) {
+        try {
+            errorHandler(failure)
+        } catch (ignored: Throwable) {
+            // An error handler that throws must not take the runtime down.
+        }
+    }
+
+    internal fun recordEffectCreated() {
+        effectCount += 1
+    }
+
+    internal fun recordEffectDisposed() {
+        effectCount -= 1
+    }
 }

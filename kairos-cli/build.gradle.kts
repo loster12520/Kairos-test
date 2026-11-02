@@ -1,6 +1,7 @@
 plugins {
-    kotlin("jvm") version "2.2.20"
+    alias(libs.plugins.kotlin.jvm)
     application
+    `maven-publish`
 }
 
 kotlin {
@@ -8,9 +9,17 @@ kotlin {
 }
 
 dependencies {
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
+    implementation(libs.kotlinx.serialization.json)
 }
 
 application {
     mainClass.set("dev.kairos.cli.MainKt")
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("maven") {
+            from(components["java"])
+        }
+    }
 }

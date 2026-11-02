@@ -1,7 +1,9 @@
 package dev.kairos.compiler
 
+import dev.kairos.ExperimentalKairosApi
 import dev.kairos.runtime.Declaration
 import dev.kairos.runtime.Layer
+import dev.kairos.runtime.StyleCondition
 import dev.kairos.runtime.classNameFor
 import java.io.File
 
@@ -13,6 +15,7 @@ class AccumulatedRule(
     val className: String,
     val layer: Layer,
     val declarations: List<Declaration>,
+    val conditions: List<StyleCondition> = emptyList(),
 ) {
     val sources: MutableSet<SourceRef> = sortedSetOf(compareBy({ it.file }, { it.line }, { it.column }))
 }
@@ -33,9 +36,12 @@ data class Conflict(
  * Hard failures (an unresolvable block, an invalid declaration, a hash collision, an ambiguous
  * composition) are collected and turned into a build failure by [throwIfFailed].
  */
+@OptIn(ExperimentalKairosApi::class)
 class KairosCollector(
     private val outputDir: File,
     private val moduleName: String = "unknown",
+    private val projectDir: File? = null,
+    private val strict: Boolean = false,
 ) {
 
     private val rules = sortedMapOf<String, AccumulatedRule>()
@@ -44,9 +50,19 @@ class KairosCollector(
     private val conflicts = ArrayList<Conflict>()
     private val fileCache = HashMap<String, String?>()
     private var sawSources = false
+    private var fallbackBlocks = 0
 
     val module: String get() = moduleName
     fun hasErrors(): Boolean = errors.isNotEmpty()
+
+    /** Strict mode turns silent fallbacks into build errors. */
+    fun isStrict(): Boolean = strict
+
+    /** Records a style expression the compiler had to leave for the runtime to concatenate. */
+    @Synchronized
+    fun reportFallback() {
+        fallbackBlocks += 1
+    }
 
     @Synchronized
     fun markSources(present: Boolean) {
@@ -55,28 +71,38 @@ class KairosCollector(
 
     /** Registers a whole style block as one class and returns that class name. */
     @Synchronized
-    fun register(layer: Layer, declarations: List<Declaration>, file: String, offset: Int): String {
+    fun register(
+        layer: Layer,
+        declarations: List<Declaration>,
+        file: String,
+        offset: Int,
+        conditions: List<StyleCondition> = emptyList(),
+    ): String {
         val clean = declarations
             .map { Declaration(it.property.trim(), it.value.trim()) }
             .sortedBy { it.property }
         if (clean.isEmpty()) {
-            errors.add(position(file, offset) + " - style block declares nothing")
+            errors.add("[KAIROS-STYLE-003] " + position(file, offset) + " - style block declares nothing")
             return ""
         }
         clean.forEach { declaration ->
             if (!isValidCssFragment(declaration.property) || !isValidCssFragment(declaration.value)) {
-                errors.add(position(file, offset) + " - declaration would corrupt the stylesheet: " + declaration.property + ": " + declaration.value)
+                errors.add(
+                    "[KAIROS-STYLE-004] " + position(file, offset) +
+                        " - declaration would corrupt the stylesheet: " + declaration.property + ": " + declaration.value
+                )
             }
         }
-        val className = classNameFor(layer, clean)
+        val className = classNameFor(layer, clean, conditions)
         val existing = rules[className]
-        if (existing != null && (existing.declarations != clean || existing.layer != layer)) {
+        if (existing != null && (existing.declarations != clean || existing.layer != layer || existing.conditions != conditions)) {
             errors.add(
-                position(file, offset) + " - class name collision on " + className + ": two different declaration groups hash to the same name"
+                "[KAIROS-STYLE-005] " + position(file, offset) + " - class name collision on " + className +
+                    ": two different declaration groups hash to the same name"
             )
             return className
         }
-        val rule = existing ?: AccumulatedRule(className, layer, clean).also { rules[className] = it }
+        val rule = existing ?: AccumulatedRule(className, layer, clean, conditions).also { rules[className] = it }
         rule.sources += sourceRef(file, offset)
         return className
     }
@@ -95,8 +121,8 @@ class KairosCollector(
     }
 
     @Synchronized
-    fun reportError(file: String, offset: Int, reason: String) {
-        errors.add(position(file, offset) + " - " + reason)
+    fun reportError(code: String, file: String, offset: Int, reason: String) {
+        errors.add("[" + code + "] " + position(file, offset) + " - " + reason)
     }
 
     @Synchronized
@@ -128,7 +154,7 @@ class KairosCollector(
 
     private fun position(file: String, offset: Int): String {
         val ref = sourceRef(file, offset)
-        return ref.file.replace('\\', '/').substringAfterLast('/') + ":" + ref.line + ":" + ref.column
+        return ref.file.replace('\\', '/') + ":" + ref.line + ":" + ref.column
     }
 
     // -- css -----------------------------------------------------------------
@@ -141,32 +167,66 @@ class KairosCollector(
             val inLayer = rules.values.filter { it.layer == layer }
             if (inLayer.isEmpty()) return@forEach
             appendLine("@layer " + layer.cssName + " {")
-            inLayer.forEach { rule ->
-                val body = rule.declarations.joinToString(" ") {
-                    it.property + ": " + it.value + ";"
+            // Rules without an at-rule first: plain blocks and pseudo class/element variants.
+            inLayer.filter { rule -> rule.conditions.none { it.atRule != null } }
+                .sortedBy { it.className }
+                .forEach { rule -> appendLine("  " + selectorOf(rule) + " { " + bodyOf(rule) + " }") }
+            // At-rule groups (media/container/supports), sorted for deterministic output.
+            inLayer.filter { rule -> rule.conditions.any { it.atRule != null } }
+                .groupBy { rule -> rule.conditions.mapNotNull { it.atRule }.joinToString(" | ") }
+                .toSortedMap()
+                .forEach { (atRules, group) ->
+                    var indent = "  "
+                    val wrappers = atRules.split(" | ")
+                    wrappers.forEach { wrapper ->
+                        appendLine(indent + wrapper + " {")
+                        indent += "  "
+                    }
+                    group.sortedBy { it.className }.forEach { rule ->
+                        appendLine(indent + selectorOf(rule) + " { " + bodyOf(rule) + " }")
+                    }
+                    wrappers.forEach { _ ->
+                        indent = indent.dropLast(2)
+                        appendLine(indent + "}")
+                    }
                 }
-                appendLine("  ." + rule.className + " { " + body + " }")
-            }
             appendLine("}")
             appendLine()
         }
         if (rules.isEmpty()) appendLine("/* no rules */")
     }
 
+    private fun selectorOf(rule: AccumulatedRule): String {
+        val suffix = rule.conditions.filter { it.atRule == null }.joinToString("") { it.selectorSuffix }
+        return "." + rule.className + suffix
+    }
+
+    private fun bodyOf(rule: AccumulatedRule): String =
+        rule.declarations.joinToString(" ") { it.property + ": " + it.value + ";" }
+
     // -- map -----------------------------------------------------------------
 
     private fun renderMap(): String = buildString {
         appendLine("{")
-        appendLine("  \"version\": 3,")
+        appendLine("  \"version\": 4,")
         appendLine("  \"module\": \"" + escape(moduleName) + "\",")
         appendLine("  \"layers\": [" + Layer.entries.joinToString(", ") { "\"" + it.cssName + "\"" } + "],")
+        appendLine(
+            "  \"coverage\": { \"rules\": " + rules.size +
+                ", \"conditionalRules\": " + rules.values.count { it.conditions.isNotEmpty() } +
+                ", \"fallbackBlocks\": " + fallbackBlocks + " },"
+        )
         appendLine("  \"rules\": [")
         val list = rules.values.toList()
         list.forEachIndexed { index, rule ->
             append("    { \"className\": \"").append(rule.className).append("\"")
             append(", \"layer\": \"").append(rule.layer.cssName).append("\"")
             append(", \"layerIndex\": ").append(rule.layer.ordinal)
-            append(", \"declarations\": [")
+            append(", \"conditions\": [")
+            append(rule.conditions.joinToString(", ") { condition ->
+                "{ \"kind\": \"" + conditionKind(condition) + "\", \"value\": \"" + escape(conditionValue(condition)) + "\" }"
+            })
+            append("], \"declarations\": [")
             append(rule.declarations.joinToString(", ") { declaration ->
                 "{ \"property\": \"" + escape(declaration.property) + "\", \"value\": \"" + escape(declaration.value) + "\" }"
             })
@@ -221,8 +281,14 @@ class KairosCollector(
         appendLine()
         appendLine("## classes (" + rules.size + ")")
         rules.values.forEach { rule ->
-            appendLine(rule.className + "  " + rule.layer.cssName + "  " + rule.declarations.joinToString("; ") { it.property + ":" + it.value })
+            val where = if (rule.conditions.isEmpty()) "" else "  [" + rule.conditions.joinToString(", ") { conditionValue(it) } + "]"
+            appendLine(rule.className + "  " + rule.layer.cssName + "  " + rule.declarations.joinToString("; ") { it.property + ":" + it.value } + where)
         }
+        appendLine("## coverage")
+        appendLine("rules " + rules.size)
+        appendLine("conditional rules " + rules.values.count { it.conditions.isNotEmpty() })
+        appendLine("fallback blocks " + fallbackBlocks)
+        appendLine()
         appendLine("## errors (" + errors.size + ")")
         if (errors.isEmpty()) appendLine("none") else errors.forEach { appendLine(it) }
         appendLine()
@@ -231,7 +297,7 @@ class KairosCollector(
             appendLine("none")
         } else {
             conflicts.forEach {
-                val where = it.where?.let { w -> w.file.replace('\\', '/').substringAfterLast('/') + ":" + w.line } ?: "?"
+                val where = it.where?.let { w -> w.file.replace('\\', '/') + ":" + w.line } ?: "?"
                 appendLine(it.property + ": " + it.winnerLayer + " (" + it.winnerValue + ") beats " + it.loserLayer + " (" + it.loserValue + ") at " + where)
             }
         }
@@ -244,9 +310,13 @@ class KairosCollector(
 
     @Synchronized
     private fun sourceRef(file: String, offset: Int): SourceRef {
-        if (offset < 0) return SourceRef(file, 0, 0, offset)
-        val text = fileCache.getOrPut(file) { runCatching { File(file).readText() }.getOrNull() }
-            ?: return SourceRef(file, 0, 0, offset)
+        // Only the project-relative path is persisted: absolute paths would make the manifest
+        // machine specific and would break byte-for-byte reproducible builds.
+        val display = displayPath(file)
+        if (offset < 0) return SourceRef(display, 0, 0, offset)
+        val text = fileCache.getOrPut(display) {
+            runCatching { absolutePath(display).readText() }.getOrNull()
+        } ?: return SourceRef(display, 0, 0, offset)
         val safeOffset = offset.coerceIn(0, text.length)
         var line = 1
         var lineStart = 0
@@ -256,7 +326,37 @@ class KairosCollector(
                 lineStart = i + 1
             }
         }
-        return SourceRef(file, line, safeOffset - lineStart + 1, offset)
+        return SourceRef(display, line, safeOffset - lineStart + 1, offset)
+    }
+
+    private fun displayPath(file: String): String {
+        val normalized = file.replace('\\', '/')
+        val root = projectDir?.absoluteFile?.toPath()?.normalize() ?: return normalized
+        return try {
+            val path = File(file).absoluteFile.toPath().normalize()
+            if (path.startsWith(root)) root.relativize(path).toString().replace('\\', '/') else normalized
+        } catch (failure: Exception) {
+            normalized
+        }
+    }
+
+    private fun absolutePath(display: String): File =
+        if (projectDir != null && !File(display).isAbsolute) projectDir.resolve(display) else File(display)
+
+    private fun conditionKind(condition: StyleCondition): String = when (condition) {
+        is StyleCondition.PseudoClass -> "pseudoClass"
+        is StyleCondition.PseudoElement -> "pseudoElement"
+        is StyleCondition.Media -> "media"
+        is StyleCondition.Container -> "container"
+        is StyleCondition.Supports -> "supports"
+    }
+
+    private fun conditionValue(condition: StyleCondition): String = when (condition) {
+        is StyleCondition.PseudoClass -> ":" + condition.name
+        is StyleCondition.PseudoElement -> "::" + condition.name
+        is StyleCondition.Media -> condition.query
+        is StyleCondition.Container -> condition.query
+        is StyleCondition.Supports -> condition.query
     }
 
     private fun escape(value: String): String = buildString {

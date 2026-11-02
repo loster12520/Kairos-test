@@ -1,7 +1,7 @@
 # Gradle
 .gradle/
 build/
-*/build/
+**/build/
 
 # Node tools
 tools/node_modules/
@@ -12,3 +12,6 @@ Thumbs.db
 
 # Kotlin
 .kotlin/
+
+# Local assistant memory
+.deepseek-harness/

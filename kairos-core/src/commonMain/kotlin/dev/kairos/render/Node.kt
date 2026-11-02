@@ -7,6 +7,31 @@ sealed interface Node
 data class TextNode(val value: String) : Node
 
 /**
+ * Raw HTML emitted verbatim. This is the only way to bypass escaping, it is deliberately ugly
+ * to write, and it must only ever receive trusted markup. Everything user supplied goes through
+ * [TextNode] or the markdown renderer instead.
+ */
+data class RawHtml(val html: String) : Node
+
+/** Explicit opt in for raw HTML; mirrors the name so reviews can grep for it. */
+fun unsafeRawHtml(html: String): Node = RawHtml(html)
+
+/**
+ * A group of nodes without a wrapping element: the component and slot primitive.
+ *
+ * A component is an ordinary Kotlin function returning a [Node]; a slot is just a parameter, and
+ * `fragment { ... }` lets a component contribute several siblings without inventing a `<div>`.
+ */
+data class FragmentNode(val children: List<Node>) : Node
+
+/** Builds a [FragmentNode] with a plain builder block. */
+fun group(block: ElementNode.() -> Unit): Node {
+    val root = ElementNode("fragment")
+    root.block()
+    return FragmentNode(root.children.toList())
+}
+
+/**
  * An element.
  *
  * Attributes are written through properties rather than through an `attr(...)` call:

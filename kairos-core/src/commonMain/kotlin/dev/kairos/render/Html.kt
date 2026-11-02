@@ -31,6 +31,15 @@ private fun renderNode(node: Node, out: StringBuilder, indent: String, depth: In
             out.append(indent.repeat(depth)).append(escapeText(node.value)).append('\n')
         }
 
+        is RawHtml -> {
+            out.append(indent.repeat(depth)).append(node.html).append('\n')
+        }
+
+        is FragmentNode -> {
+            // A fragment contributes its children at the current depth; it never emits a tag.
+            node.children.forEach { renderNode(it, out, indent, depth) }
+        }
+
         is ElementNode -> {
             requireValidName(node.tag, "element name")
             node.attributes.keys.forEach { requireValidName(it, "attribute name") }
@@ -40,7 +49,10 @@ private fun renderNode(node: Node, out: StringBuilder, indent: String, depth: In
             val pad = indent.repeat(depth)
             out.append(pad).append('<').append(node.tag)
             node.attributes.forEach { (name, value) ->
-                out.append(' ').append(name).append("=\"").append(escapeAttribute(value)).append('"')
+                // Second line of defence: attributes set through raw map access still cannot
+                // smuggle a javascript: URL into the document.
+                val safe = if (name.lowercase() in URL_ATTRIBUTES) requireSafeUrl(name, value) else value
+                out.append(' ').append(name).append("=\"").append(escapeAttribute(safe)).append('"')
             }
             if (node.tag in voidElements) {
                 out.append(">").append('\n')

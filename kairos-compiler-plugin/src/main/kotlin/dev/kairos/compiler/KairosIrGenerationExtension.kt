@@ -2,6 +2,8 @@ package dev.kairos.compiler
 
 import dev.kairos.runtime.Declaration
 import dev.kairos.runtime.Layer
+import dev.kairos.runtime.PropertyRelations
+import dev.kairos.runtime.StyleCondition
 import dev.kairos.runtime.classNameFor
 import org.jetbrains.kotlin.backend.common.extensions.IrGenerationExtension
 import org.jetbrains.kotlin.backend.common.extensions.IrPluginContext
@@ -44,7 +46,6 @@ private const val CSS_FQN = "dev.kairos.runtime.css"
 private const val STYLES_FQN = "dev.kairos.runtime.styles"
 private const val DECLARATION_FQN = "dev.kairos.runtime.StyleScope.declaration"
 private const val MAX_INLINE_DEPTH = 12
-private const val MAX_COMBINATIONS = 8
 
 /**
  * Folds style blocks into class lists.
@@ -107,12 +108,6 @@ private fun variantsOf(entries: List<Pair<String, Eval?>>): List<Variant> {
     choices.forEachIndexed { choiceIndex, entry ->
         val options = entry.second.arms.withIndex().filter { it.value.value != null }
         if (options.isEmpty()) throw NotFoldable("choice for " + entry.first + " has no reachable arm")
-        if (variants.size * options.size > MAX_COMBINATIONS) {
-            throw NotFoldable(
-                "too many conditional combinations in one block (" + (variants.size * options.size) +
-                    "); split the block or use a layer instead"
-            )
-        }
         variants = variants.flatMap { variant ->
             options.map { option ->
                 val arms = variant.arms.copyOf()
@@ -159,7 +154,8 @@ private class DeclarationCounter(private val resolver: StyleResolver) : IrElemen
         if (expression.symbol.owner.fqNameWhenAvailable?.asString() == CSS_FQN) {
             runCatching {
                 val (layer, lambda) = cssArguments(expression)
-                val entries = resolver.interpretBlock(lambda.function.body, Bindings.EMPTY)
+                val block = resolver.interpretBlock(lambda.function.body, Bindings.EMPTY)
+                val entries = block.base.entries.map { it.key to it.value }
                 variantsOf(entries).forEach { variant ->
                     variant.declarations.forEach { declaration ->
                         val key = keyOf(layer, declaration)
@@ -234,16 +230,57 @@ private class KairosTransformer(
 
     private fun foldCss(call: IrCall): IrExpression? = try {
         val (layer, lambda) = cssArguments(call)
-        val entries = resolver.interpretBlock(lambda.function.body, Bindings.EMPTY)
+        val block = resolver.interpretBlock(lambda.function.body, Bindings.EMPTY)
+        val entries = block.base.entries.map { it.key to it.value }
         val variants = variantsOf(entries)
+        if (variants.size > 1 && block.conditional.isNotEmpty()) {
+            throw NotFoldable(
+                "a block cannot mix conditional values (when/if) with hover/media rules; split the block"
+            )
+        }
         if (variants.size == 1) {
-            stringConst(call, classListFor(layer, variants[0].declarations, currentFile, call.startOffset))
+            val classes = ArrayList<String>()
+            if (variants[0].declarations.isNotEmpty()) {
+                classes += classListFor(layer, variants[0].declarations, currentFile, call.startOffset)
+            }
+            block.conditional.forEach { group ->
+                val declarations = group.declarations.map { (property, value) ->
+                    val literal = value as? Eval.Lit
+                        ?: throw NotFoldable("a style value inside a conditional block is not a constant")
+                    Declaration(property, literal.text)
+                }
+                if (declarations.isNotEmpty()) {
+                    classes += collector.register(
+                        layer,
+                        declarations,
+                        currentFile,
+                        call.startOffset,
+                        group.conditions,
+                    )
+                }
+            }
+            stringConst(call, classes.filter { it.isNotEmpty() }.distinct().joinToString(" "))
         } else {
+            // Axis model: one class per property arm, never one class per *combination*. A block
+            // with k independent binary choices costs 1 + 2k classes instead of 2^k, so the old
+            // eight-combination ceiling is gone. The emitted selection concatenates the base class
+            // with one arm class per choice; style values still never reach the runtime.
             val choices = entries.mapNotNull { entry -> (entry.second as? Eval.Choice)?.let { entry.first to it } }
-            val classByArms = LinkedHashMap<String, String>()
-            variants.forEach { variant ->
-                classByArms[variant.arms.joinToString(",")] =
-                    classListFor(layer, variant.declarations, currentFile, call.startOffset)
+            val static = entries.mapNotNull { entry ->
+                (entry.second as? Eval.Lit)?.let { Declaration(entry.first, it.text) }
+            }
+            val baseClasses = if (static.isEmpty()) "" else classListFor(layer, static, currentFile, call.startOffset)
+            val armClasses = HashMap<String, String>()
+            choices.forEach { (property, choice) ->
+                choice.arms.forEachIndexed { index, arm ->
+                    val value = arm.value ?: return@forEachIndexed
+                    armClasses[property + "\u0000" + index] = collector.register(
+                        layer,
+                        listOf(Declaration(property, value)),
+                        currentFile,
+                        call.startOffset,
+                    )
+                }
             }
             // Conditions must not read anything declared inside the style lambda: the emitted
             // selection lives at the call site, outside that scope.
@@ -255,33 +292,63 @@ private class KairosTransformer(
                 } }
             }
             buildSelection(choices, call) { arms ->
-                classByArms[arms.joinToString(",")] ?: throw NotFoldable("missing variant for " + arms.joinToString(","))
+                val parts = ArrayList<String>()
+                if (baseClasses.isNotEmpty()) parts += baseClasses
+                choices.forEachIndexed { index, (property, _) ->
+                    parts += armClasses[property + "\u0000" + arms[index]]
+                        ?: throw NotFoldable("missing arm " + arms[index] + " for " + property)
+                }
+                parts.filter { it.isNotEmpty() }.distinct().joinToString(" ")
             }
         }
     } catch (failure: Error) {
         throw failure
     } catch (failure: NotFoldable) {
-        collector.reportError(currentFile, call.startOffset, "cannot resolve style block: " + failure.message)
+        collector.reportError("KAIROS-STYLE-001", currentFile, call.startOffset, "cannot resolve style block: " + failure.message)
         null
     } catch (failure: Throwable) {
-        collector.reportError(currentFile, call.startOffset, "internal error while folding: " + (failure.message ?: failure::class.simpleName))
+        collector.reportError("KAIROS-STYLE-002", currentFile, call.startOffset, "internal error while folding: " + (failure.message ?: failure::class.simpleName))
         null
     }
 
     private fun foldStyles(call: IrCall): IrExpression? = try {
         val parts = resolver.resolveStyles(varargArguments(call))
         resolver.checkComposition(parts, currentFile, call.startOffset)
-        val classNames = parts.map { part -> classListFor(part.layer, part.declarations, currentFile, call.startOffset) }
+        val classNames = parts.map { part ->
+            val classes = ArrayList<String>()
+            if (part.declarations.isNotEmpty()) {
+                classes += classListFor(part.layer, part.declarations, currentFile, call.startOffset)
+            }
+            part.conditional.forEach { group ->
+                classes += collector.register(
+                    part.layer,
+                    group.declarations,
+                    currentFile,
+                    call.startOffset,
+                    group.conditions,
+                )
+            }
+            classes.filter { it.isNotEmpty() }.distinct().sorted().joinToString(" ")
+        }
         stringConst(call, classNames.joinToString(" ").split(" ").filter { it.isNotEmpty() }.distinct().sorted().joinToString(" "))
     } catch (failure: Error) {
         throw failure
     } catch (failure: NotFoldable) {
         // Composition is a plain concatenation in both paths, so an operand the compiler cannot
-        // see through is not an error: the call is left in place and the runtime concatenates.
-        // Only the ambiguity check is skipped in that case.
+        // see through stays a runtime concatenation. Strict mode promotes that fallback to an
+        // error so CI can forbid silent degradation.
+        collector.reportFallback()
+        if (collector.isStrict()) {
+            collector.reportError(
+                "KAIROS-STYLE-007",
+                currentFile,
+                call.startOffset,
+                "strict mode: styles(...) could not be folded: " + failure.message,
+            )
+        }
         null
     } catch (failure: Throwable) {
-        collector.reportError(currentFile, call.startOffset, "internal error while folding styles: " + (failure.message ?: failure::class.simpleName))
+        collector.reportError("KAIROS-STYLE-002", currentFile, call.startOffset, "internal error while folding styles: " + (failure.message ?: failure::class.simpleName))
         null
     }
 
@@ -370,9 +437,29 @@ private class KairosTransformer(
     }
 }
 
+/** The declarations of one style block split by condition: base rules plus conditional groups. */
+internal class InterpretedBlock {
+    val base: LinkedHashMap<String, Eval?> = LinkedHashMap()
+    val conditional: MutableList<ConditionalGroup> = ArrayList()
+}
+
+internal class ConditionalGroup(
+    val conditions: List<StyleCondition>,
+    val declarations: LinkedHashMap<String, Eval?>,
+)
+
 internal class StyleSource(val symbol: Any, val initializer: IrExpression?)
 
-internal data class ResolvedStyle(val layer: Layer, val declarations: List<Declaration>)
+internal data class ResolvedStyle(
+    val layer: Layer,
+    val declarations: List<Declaration>,
+    val conditional: List<ResolvedConditional> = emptyList(),
+)
+
+internal data class ResolvedConditional(
+    val conditions: List<StyleCondition>,
+    val declarations: List<Declaration>,
+)
 
 internal class StyleResolver(
     private val pluginContext: IrPluginContext,
@@ -384,43 +471,72 @@ internal class StyleResolver(
     private val inProgress = LinkedHashSet<Any>()
     private var evalDepth = 0
 
-    fun interpretBlock(body: IrBody?, bindings: Bindings): List<Pair<String, Eval?>> {
-        val collected = LinkedHashMap<String, Eval?>()
-        runBody(body, bindings, 0, collected)
-        return collected.entries.map { it.key to it.value }
+    fun interpretBlock(body: IrBody?, bindings: Bindings): InterpretedBlock {
+        val collected = InterpretedBlock()
+        runBody(body, bindings, 0, collected, emptyList())
+        return collected
     }
 
-    private fun runBody(body: IrBody?, bindings: Bindings, depth: Int, out: MutableMap<String, Eval?>) {
+    private fun runBody(
+        body: IrBody?,
+        bindings: Bindings,
+        depth: Int,
+        out: InterpretedBlock,
+        stack: List<StyleCondition>,
+    ) {
         if (depth > MAX_INLINE_DEPTH) throw NotFoldable("inline expansion too deep")
         val block = body as? IrBlockBody
             ?: throw NotFoldable("style body is " + (body?.let { it::class.simpleName } ?: "null"))
         block.statements.forEach { statement ->
             val expression = statement as? IrExpression
                 ?: throw NotFoldable("non-expression statement " + statement::class.simpleName)
-            runStatement(expression, bindings, depth, out)
+            runStatement(expression, bindings, depth, out, stack)
         }
     }
 
-    private fun runStatement(raw: IrExpression, bindings: Bindings, depth: Int, out: MutableMap<String, Eval?>) {
+    private fun runStatement(
+        raw: IrExpression,
+        bindings: Bindings,
+        depth: Int,
+        out: InterpretedBlock,
+        stack: List<StyleCondition>,
+    ) {
         when (val expression = raw.unwrapCasts()) {
-            is IrReturn -> runStatement(expression.value, bindings, depth, out)
+            is IrReturn -> runStatement(expression.value, bindings, depth, out, stack)
             is IrBlock -> expression.statements.forEach { inner ->
                 val child = inner as? IrExpression ?: throw NotFoldable("non-expression block statement")
-                runStatement(child, bindings, depth, out)
+                runStatement(child, bindings, depth, out, stack)
             }
             is IrConst -> if (expression.value != Unit) throw NotFoldable("stray constant in a style body")
-            is IrCall -> runCall(expression, bindings, depth, out)
+            is IrCall -> runCall(expression, bindings, depth, out, stack)
             is IrWhen -> {
                 val selected = selectConstantBranch(expression)
                     ?: throw NotFoldable("a style block contains a conditional statement")
-                runStatement(selected, bindings, depth, out)
+                runStatement(selected, bindings, depth, out, stack)
             }
             else -> throw NotFoldable("unsupported style statement " + expression::class.simpleName)
         }
     }
 
-    private fun runCall(call: IrCall, bindings: Bindings, depth: Int, out: MutableMap<String, Eval?>) {
+    private fun runCall(
+        call: IrCall,
+        bindings: Bindings,
+        depth: Int,
+        out: InterpretedBlock,
+        stack: List<StyleCondition>,
+    ) {
         val callee = call.symbol.owner
+        val condition = conditionFor(call, callee, bindings)
+        if (condition != null) {
+            val lambda = call.arguments.lastOrNull { it is IrFunctionExpression } as? IrFunctionExpression
+                ?: throw NotFoldable("conditional style block without a lambda")
+            val child = InterpretedBlock()
+            runBody(lambda.function.body, bindings, depth + 1, child, stack + condition)
+            val effective = stack + condition
+            if (child.base.isNotEmpty()) out.conditional += ConditionalGroup(effective, child.base)
+            out.conditional += child.conditional
+            return
+        }
         if (callee.fqNameWhenAvailable?.asString() == DECLARATION_FQN) {
             val propertyExpression = call.arguments.getOrNull(call.arguments.size - 2)
                 ?: throw NotFoldable("declaration() without a property")
@@ -430,7 +546,7 @@ internal class StyleResolver(
                 ?: throw NotFoldable("property is not a constant: " + propertyExpression.renderShort())
             val value = evaluate(valueExpression, bindings)
                 ?: throw NotFoldable("value is not decidable: " + valueExpression.renderShort())
-            out[property] = value
+            out.base[property] = value
             return
         }
         val frameworkProperty = frameworkProperty(callee)
@@ -439,12 +555,51 @@ internal class StyleResolver(
                 ?: throw NotFoldable("helper without an argument: " + callee.name)
             val value = evaluate(valueExpression, bindings)
                 ?: throw NotFoldable("helper argument is not decidable: " + valueExpression.renderShort())
-            out[frameworkProperty] = value
+            out.base[frameworkProperty] = value
             return
         }
         val body = callee.body ?: throw NotFoldable("helper has no IR body: " + callee.fqNameWhenAvailable)
         val inner = bindArguments(callee, call, bindings)
-        runBody(body, inner, depth + 1, out)
+        runBody(body, inner, depth + 1, out, stack)
+    }
+
+    /** Recognises `hover { }`, `media("...") { }` and friends declared on StyleScope. */
+    private fun conditionFor(call: IrCall, callee: IrFunction, bindings: Bindings): StyleCondition? {
+        val fqName = callee.fqNameWhenAvailable?.asString() ?: return null
+        if (!fqName.startsWith("dev.kairos.runtime.StyleScope.")) return null
+        return when (callee.name.asString()) {
+            "hover" -> StyleCondition.PseudoClass("hover")
+            "focus" -> StyleCondition.PseudoClass("focus")
+            "focusVisible" -> StyleCondition.PseudoClass("focus-visible")
+            "active" -> StyleCondition.PseudoClass("active")
+            "disabled" -> StyleCondition.PseudoClass("disabled")
+            "checked" -> StyleCondition.PseudoClass("checked")
+            "before" -> StyleCondition.PseudoElement("before")
+            "after" -> StyleCondition.PseudoElement("after")
+            "media", "container", "supports" -> {
+                val query = stringArgument(call, callee, "query", bindings)
+                    ?: throw NotFoldable(callee.name.asString() + " needs a constant string query")
+                when (callee.name.asString()) {
+                    "media" -> StyleCondition.Media(query)
+                    "container" -> StyleCondition.Container(query)
+                    else -> StyleCondition.Supports(query)
+                }
+            }
+            else -> null
+        }
+    }
+
+    private fun stringArgument(
+        call: IrCall,
+        callee: IrFunction,
+        name: String,
+        bindings: Bindings,
+    ): String? {
+        val index = callee.parameters.indexOfFirst { it.name.asString() == name }
+        if (index < 0) return null
+        val offset = call.arguments.size - callee.parameters.size
+        val expression = call.arguments.getOrNull(offset + index) ?: return null
+        return (evaluate(expression, bindings) as? Eval.Lit)?.text
     }
 
     private fun selectConstantBranch(whenExpression: IrWhen): IrExpression? {
@@ -669,37 +824,58 @@ internal class StyleResolver(
         val layerExpression = if (layerIndex >= 0) call.arguments.getOrNull(layerIndex) else null
         val layer = if (layerExpression == null) Layer.Base else resolveLayer(layerExpression)
             ?: throw NotFoldable("cannot resolve layer")
-        val entries = interpretBlock(lambda.function.body, Bindings.EMPTY)
-        val declarations = entries.map { entry ->
-            val literal = entry.second as? Eval.Lit
+        val block = interpretBlock(lambda.function.body, Bindings.EMPTY)
+        val declarations = block.base.entries.map { entry ->
+            val literal = entry.value as? Eval.Lit
                 ?: throw NotFoldable("styles(...) cannot compose a block with a conditional value")
-            Declaration(entry.first, literal.text)
+            Declaration(entry.key, literal.text)
         }
-        return ResolvedStyle(layer, declarations)
+        // Conditional rules travel with the block: each one becomes its own class, so composing
+        // blocks stays a plain class concatenation.
+        val conditional = block.conditional.map { group ->
+            ResolvedConditional(
+                group.conditions,
+                group.declarations.map { entry ->
+                    val literal = entry.value as? Eval.Lit
+                        ?: throw NotFoldable("styles(...) cannot compose a block with a conditional value")
+                    Declaration(entry.key, literal.text)
+                },
+            )
+        }
+        return ResolvedStyle(layer, declarations, conditional)
     }
 
     fun checkComposition(parts: List<ResolvedStyle>, file: String, offset: Int) {
-        val byProperty = LinkedHashMap<String, MutableList<Pair<Layer, Declaration>>>()
-        parts.forEach { part ->
-            part.declarations.forEach { declaration ->
-                byProperty.getOrPut(declaration.property) { ArrayList() } += part.layer to declaration
-            }
-        }
-        byProperty.forEach { (property, entries) ->
-            for (i in 0 until entries.size) {
-                for (j in i + 1 until entries.size) {
-                    val (leftLayer, left) = entries[i]
-                    val (rightLayer, right) = entries[j]
-                    if (left == right) continue
-                    if (leftLayer == rightLayer) {
-                        collector.reportError(
-                            file, offset,
-                            "ambiguous composition: " + property + " set twice in " + leftLayer.cssName +
-                                " (" + left.value + " vs " + right.value + "); put one of them in a different layer",
-                        )
-                    } else {
-                        collector.recordConflict(property, entries[i], entries[j], file, offset)
-                    }
+        // Same-property pairs are the obvious case; shorthand/longhand pairs are the subtle one:
+        // `padding` and `padding-top` in the same layer make the result depend on serialisation
+        // order, so they are rejected exactly like a duplicate property.
+        val declarations = ArrayList<Pair<Layer, Declaration>>()
+        parts.forEach { part -> part.declarations.forEach { declarations += part.layer to it } }
+        for (i in 0 until declarations.size) {
+            for (j in i + 1 until declarations.size) {
+                val (leftLayer, left) = declarations[i]
+                val (rightLayer, right) = declarations[j]
+                if (left == right) continue
+                if (!PropertyRelations.overlaps(left.property, right.property)) continue
+                if (leftLayer == rightLayer) {
+                    collector.reportError(
+                        "KAIROS-STYLE-006",
+                        file, offset,
+                        "ambiguous composition: " + left.property + " and " + right.property + " overlap in " +
+                            leftLayer.cssName + " (" + left.value + " vs " + right.value +
+                            "); put one of them in a different layer",
+                    )
+                } else {
+                    val conflictProperty =
+                        if (left.property == right.property) left.property
+                        else left.property + " / " + right.property
+                    collector.recordConflict(
+                        conflictProperty,
+                        leftLayer to left,
+                        rightLayer to right,
+                        file,
+                        offset,
+                    )
                 }
             }
         }

@@ -1,8 +1,10 @@
 package dev.kairos.blog
 
 import dev.kairos.htmx.fragment
+import dev.kairos.htmx.hxConfirm
 import dev.kairos.htmx.hxGet
 import dev.kairos.htmx.hxPost
+import dev.kairos.htmx.hxInclude
 import dev.kairos.htmx.hxPushUrl
 import dev.kairos.htmx.hxSwap
 import dev.kairos.htmx.hxTarget
@@ -32,6 +34,7 @@ import dev.kairos.render.placeholder
 import dev.kairos.render.span
 import dev.kairos.render.textarea
 import dev.kairos.render.type
+import dev.kairos.render.value
 import dev.kairos.render.value as valueAttr
 import dev.kairos.runtime.Fonts
 import dev.kairos.runtime.Layer
@@ -68,6 +71,7 @@ import dev.kairos.runtime.width
  */
 
 var ElementNode.dataKairosId: String by attribute("data-kairos-id")
+var ElementNode.dataKairosMount: String by attribute("data-kairos-mount")
 var ElementNode.required: Boolean by flagAttribute("required")
 var ElementNode.rows: String by attribute("rows")
 
@@ -195,6 +199,44 @@ val commentStyle: String = css {
     backgroundColor("var(--surface)")
 }
 
+val cardActionsStyle: String = css {
+    display("flex")
+    gap(Spacing.SM)
+    alignItems("center")
+    margin("10px 0 0 0")
+}
+
+val sortBarStyle: String = css {
+    display("flex")
+    gap(Spacing.SM)
+    alignItems("center")
+    margin("0 0 12px 0")
+    fontSize("13px")
+    color("#5b6071")
+}
+
+val smallButtonStyle: String = css {
+    declaration("font", "inherit")
+    fontSize("13px")
+    padding("5px 10px")
+    borderRadius(Radius.SM)
+    border("1px solid #d5d7dd")
+    backgroundColor("#ffffff")
+    color("#16181d")
+    cursor("pointer")
+    hover {
+        backgroundColor("#f2f3f7")
+    }
+}
+
+val formErrorStyle: String = css(Layer.Override) {
+    color("#b42318")
+    backgroundColor("#fdecea")
+    borderRadius(Radius.SM)
+    padding("8px 12px")
+    margin("0 0 12px 0")
+}
+
 val commentaryHeaderStyle: String = css(Layer.Override) {
     display("flex")
     gap(Spacing.SM)
@@ -207,11 +249,18 @@ val commentaryHeaderStyle: String = css(Layer.Override) {
 fun blogPage(
     posts: List<Post>,
     commentCounts: Map<Long, Int>,
+    csrfToken: String,
     openPost: Post? = null,
     openComments: List<Comment> = emptyList(),
 ): String {
     val tree = el("div") {
         style = pageStyle
+        input {
+            type = "hidden"
+            id = "csrf-token"
+            name = "_csrf"
+            value = csrfToken
+        }
         div {
             style = shellStyle
             header {
@@ -226,6 +275,7 @@ fun blogPage(
                     input {
                         style = filterInputStyle
                         dataKairosId = "filter"
+                        dataKairosMount = "filter"
                         type = "search"
                         name = "filter"
                         placeholder = "Filter posts..."
@@ -233,6 +283,7 @@ fun blogPage(
                     button {
                         style = buttonStyle
                         dataKairosId = "theme-toggle"
+                        dataKairosMount = "theme-toggle"
                         type = "button"
                         "Toggle theme".text
                     }
@@ -261,7 +312,27 @@ fun blogPage(
                 }
                 div {
                     id = "detail"
-                    openPost?.let { add(postDetailElement(it, openComments)) }
+                    openPost?.let { add(postDetailElement(it, openComments, csrfToken)) }
+                }
+                div {
+                    style = sortBarStyle
+                    "Sort:".text
+                    button {
+                        style = smallButtonStyle
+                        type = "button"
+                        hxGet = "/posts/list"
+                        hxTarget = "#post-list"
+                        hxSwap = "outerHTML"
+                        "Newest".text
+                    }
+                    button {
+                        style = smallButtonStyle
+                        type = "button"
+                        hxGet = "/posts/list?sort=comments"
+                        hxTarget = "#post-list"
+                        hxSwap = "outerHTML"
+                        "Most comments".text
+                    }
                 }
                 add(postList(posts, commentCounts))
             }
@@ -281,8 +352,11 @@ fun blogPage(
     )
 }
 
-fun postList(posts: List<Post>, commentCounts: Map<Long, Int>): ElementNode = div {
+fun postList(posts: List<Post>, commentCounts: Map<Long, Int>, oob: Boolean = false): ElementNode = div {
     id = "post-list"
+    dataKairosMount = "post-list"
+    // When a create replaces the list in place, htmx must also swap the out-of-band copy.
+    if (oob) attributes["hx-swap-oob"] = "true"
     posts.forEach { post ->
         div {
             style = cardStyle
@@ -304,6 +378,27 @@ fun postList(posts: List<Post>, commentCounts: Map<Long, Int>): ElementNode = di
                 (post.createdAt.take(10) + " · " + (commentCounts[post.id] ?: 0) + " comments").text
             }
             p { style = proseStyle; excerpt(post.body).text }
+            div {
+                style = cardActionsStyle
+                button {
+                    style = smallButtonStyle
+                    type = "button"
+                    hxGet = "/posts/" + post.id + "/edit"
+                    hxTarget = "#detail"
+                    hxSwap = "innerHTML"
+                    "Edit".text
+                }
+                button {
+                    style = smallButtonStyle
+                    type = "button"
+                    hxPost = "/posts/" + post.id + "/delete"
+                    hxInclude = "#csrf-token"
+                    hxTarget = "#post-list"
+                    hxSwap = "outerHTML"
+                    hxConfirm = "Delete this post?"
+                    "Delete".text
+                }
+            }
         }
     }
 }
@@ -313,28 +408,59 @@ private fun excerpt(body: String, limit: Int = 180): String {
     return if (plain.length <= limit) plain else plain.take(limit).trimEnd() + "..."
 }
 
-fun postDetailElement(post: Post, comments: List<Comment>): ElementNode = el("div") {
+fun postDetailElement(post: Post, comments: List<Comment>, csrfToken: String): ElementNode = el("div") {
     article {
         style = cardStyle
-        h2 { style = cardTitleStyle; post.title.text }
+        h2 {
+            style = cardTitleStyle
+            attributes["id"] = "detail-title"
+            attributes["tabindex"] = "-1"
+            post.title.text
+        }
         p { style = mutedStyle; (post.createdAt.take(10) + " · " + post.slug).text }
         div {
             style = proseStyle
             markdown(post.body)
         }
     }
-    add(commentsSection(post.id, comments))
+    div {
+        style = cardActionsStyle
+        button {
+            style = smallButtonStyle
+            type = "button"
+            hxGet = "/posts/" + post.id + "/edit"
+            hxTarget = "#detail"
+            hxSwap = "innerHTML"
+            "Edit post".text
+        }
+    }
+    add(commentsSection(post.id, comments, csrfToken))
 }
 
-fun postDetail(post: Post, comments: List<Comment>): String = fragment(postDetailElement(post, comments))
+fun postDetail(post: Post, comments: List<Comment>, csrfToken: String): String =
+    fragment(postDetailElement(post, comments, csrfToken))
 
-private fun commentForm(postId: Long): ElementNode = el("form") {
+private fun commentForm(
+    postId: Long,
+    csrfToken: String,
+    error: String = "",
+    author: String = "",
+    body: String = "",
+): ElementNode = el("form") {
     style = cardStyle
     hxPost = "/posts/" + postId + "/comments"
     hxTarget = "#comments"
     hxSwap = "outerHTML"
     h2 { style = cardTitleStyle; "Add a comment".text }
+    if (error.isNotEmpty()) {
+        p { style = formErrorStyle; error.text }
+    }
     p { style = mutedStyle; "Markdown is supported: **bold**, *italic*, lists, code.".text }
+    input {
+        type = "hidden"
+        name = "_csrf"
+        value = csrfToken
+    }
     div {
         style = fieldStyle
         label { "Name".text }
@@ -343,6 +469,7 @@ private fun commentForm(postId: Long): ElementNode = el("form") {
             type = "text"
             required = true
             style = inputStyle
+            value = author
         }
     }
     div {
@@ -353,13 +480,24 @@ private fun commentForm(postId: Long): ElementNode = el("form") {
             required = true
             rows = "4"
             style = inputStyle
+            body.text
         }
     }
     button { style = buttonStyle; type = "submit"; "Post comment".text }
 }
 
-fun commentsSection(postId: Long, comments: List<Comment>): ElementNode = div {
+fun commentsSection(
+    postId: Long,
+    comments: List<Comment>,
+    csrfToken: String,
+    error: String = "",
+    author: String = "",
+    body: String = "",
+): ElementNode = div {
     id = "comments"
+    // Screen readers announce appended comments without stealing focus.
+    attributes["role"] = "status"
+    attributes["aria-live"] = "polite"
     comments.forEach { comment ->
         div {
             style = commentStyle
@@ -374,17 +512,31 @@ fun commentsSection(postId: Long, comments: List<Comment>): ElementNode = div {
             }
         }
     }
-    add(commentForm(postId))
+    add(commentForm(postId, csrfToken, error, author, body))
 }
 
-fun newPostForm(): String = fragment(el("div") {
+fun editPostForm(
+    post: Post,
+    csrfToken: String,
+    title: String = post.title,
+    body: String = post.body,
+    error: String = "",
+): String = fragment(el("div") {
+    id = "edit-post-form"
     form {
         style = cardStyle
-        hxPost = "/posts"
-        hxTarget = "#post-list"
-        hxSwap = "outerHTML"
-        h2 { style = cardTitleStyle; "New post".text }
-        p { style = mutedStyle; "The body is rendered as Markdown.".text }
+        hxPost = "/posts/" + post.id
+        hxTarget = "#detail"
+        hxSwap = "innerHTML"
+        h2 { style = cardTitleStyle; "Edit post".text }
+        if (error.isNotEmpty()) {
+            p { style = formErrorStyle; error.text }
+        }
+        input {
+            type = "hidden"
+            name = "_csrf"
+            value = csrfToken
+        }
         div {
             style = fieldStyle
             label { "Title".text }
@@ -393,6 +545,66 @@ fun newPostForm(): String = fragment(el("div") {
                 type = "text"
                 required = true
                 style = inputStyle
+                value = title
+            }
+        }
+        div {
+            style = fieldStyle
+            label { "Body".text }
+            textarea {
+                name = "body"
+                required = true
+                rows = "8"
+                style = inputStyle
+                body.text
+            }
+        }
+        div {
+            style = cardActionsStyle
+            button { style = buttonStyle; type = "submit"; "Save".text }
+            button {
+                style = smallButtonStyle
+                type = "button"
+                hxGet = "/posts/" + post.id
+                hxTarget = "#detail"
+                hxSwap = "innerHTML"
+                "Cancel".text
+            }
+        }
+    }
+})
+
+fun newPostForm(
+    csrfToken: String,
+    title: String = "",
+    body: String = "",
+    error: String = "",
+): String = fragment(el("div") {
+    id = "new-post-form"
+    form {
+        style = cardStyle
+        hxPost = "/posts"
+        hxTarget = "#new-post-form"
+        hxSwap = "outerHTML"
+        h2 { style = cardTitleStyle; "New post".text }
+        if (error.isNotEmpty()) {
+            p { style = formErrorStyle; error.text }
+        }
+        p { style = mutedStyle; "The body is rendered as Markdown.".text }
+        input {
+            type = "hidden"
+            name = "_csrf"
+            value = csrfToken
+        }
+        div {
+            style = fieldStyle
+            label { "Title".text }
+            input {
+                name = "title"
+                type = "text"
+                required = true
+                style = inputStyle
+                value = title
             }
         }
         div {

@@ -1,1 +1,1 @@
-{"name":"kairos-tools","private":true,"type":"module","dependencies":{"jsdom":"^29.1.1","playwright":"^1.64.1"}}
+{"name":"kairos-tools","private":true,"type":"module","dependencies":{"axe-core":"^4.14.0","jsdom":"^29.1.1","playwright":"^1.64.1"}}

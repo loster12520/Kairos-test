@@ -1,12 +1,9 @@
 import org.jetbrains.kotlin.gradle.dsl.JsModuleKind
 
 plugins {
-    kotlin("multiplatform") version "2.2.20"
+    alias(libs.plugins.kotlin.multiplatform)
+    alias(libs.plugins.kairos)
 }
-
-val kairosPluginProject = project(":kairos-compiler-plugin")
-val kairosPluginJarPath = kairosPluginProject.layout.buildDirectory.file("libs/kairos-compiler-plugin.jar")
-val kairosOutDir = layout.buildDirectory.dir("kairos")
 
 kotlin {
     jvm()
@@ -14,11 +11,6 @@ kotlin {
         nodejs()
         compilerOptions {
             moduleKind.set(JsModuleKind.MODULE_UMD)
-            freeCompilerArgs.addAll(
-                "-Xplugin=" + kairosPluginJarPath.get().asFile.absolutePath,
-                "-P", "plugin:dev.kairos:outputDir=" + kairosOutDir.get().asFile.absolutePath,
-                "-P", "plugin:dev.kairos:module=demo-web-feature",
-            )
         }
     }
     sourceSets {
@@ -26,12 +18,5 @@ kotlin {
     }
 }
 
-val kairosCompileTasks = setOf("compileKotlinJs")
-tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask<*>>().configureEach {
-    dependsOn(kairosPluginProject.tasks.named("jar"))
-    inputs.file(kairosPluginJarPath)
-    if (name in kairosCompileTasks) {
-        outputs.dir(kairosOutDir)
-        outputs.cacheIf { false }
-    }
-}
+// The stylesheet of this module is written by the dev.kairos plugin next to the compilation
+// output; see build/kairos/<target>/<compilation>/kairos.css.

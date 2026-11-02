@@ -34,6 +34,8 @@ fun page(
     language: String = "en",
     scripts: List<String> = emptyList(),
     headContent: ElementNode? = null,
+    /** CSP nonce applied to every stylesheet and script this page emits. */
+    nonce: String? = null,
 ): String {
     val document = el("html") {
         lang = language
@@ -41,12 +43,23 @@ fun page(
             meta { charset = "utf-8" }
             meta { name = "viewport"; content = "width=device-width, initial-scale=1" }
             add(el("title") { text(title) })
-            stylesheets.forEach { path -> link { rel = "stylesheet"; href = path } }
+            stylesheets.forEach { path ->
+                link {
+                    rel = "stylesheet"
+                    href = path
+                    if (nonce != null) attributes["nonce"] = nonce
+                }
+            }
             headContent?.let { add(it) }
         }
         body {
             add(bodyNode)
-            scripts.forEach { path -> script { src = path } }
+            scripts.forEach { path ->
+                script {
+                    src = path
+                    if (nonce != null) attributes["nonce"] = nonce
+                }
+            }
         }
     }
     return renderToHtml(document)

@@ -1,0 +1,32 @@
+public final class dev/kairos/htmx/HtmxKt {
+	public static final fun fragment (Ldev/kairos/render/Node;)Ljava/lang/String;
+	public static final fun getHxBoost (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxConfirm (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxDelete (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxGet (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxInclude (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxIndicator (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxPost (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxPushUrl (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxPut (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxSwap (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxTarget (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxTrigger (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun getHxVals (Ldev/kairos/render/ElementNode;)Ljava/lang/String;
+	public static final fun page (Ljava/lang/String;Ljava/util/List;Ldev/kairos/render/ElementNode;Ljava/lang/String;Ljava/util/List;Ldev/kairos/render/ElementNode;Ljava/lang/String;)Ljava/lang/String;
+	public static synthetic fun page$default (Ljava/lang/String;Ljava/util/List;Ldev/kairos/render/ElementNode;Ljava/lang/String;Ljava/util/List;Ldev/kairos/render/ElementNode;Ljava/lang/String;ILjava/lang/Object;)Ljava/lang/String;
+	public static final fun setHxBoost (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxConfirm (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxDelete (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxGet (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxInclude (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxIndicator (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxPost (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxPushUrl (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxPut (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxSwap (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxTarget (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxTrigger (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+	public static final fun setHxVals (Ldev/kairos/render/ElementNode;Ljava/lang/String;)V
+}
+

@@ -163,6 +163,27 @@ check('B8', 'the reactive binding updates only the text node it owns', () => {
   return before + ' -> ' + afterOne + ' -> ' + afterTwo + ', still no inline style';
 });
 
+check('B9', 'conditional styles ship and every conditional class is mounted', () => {
+  const cssText = readFileSync(CSS, 'utf8');
+  const map = JSON.parse(readFileSync(join(SITE, 'kairos.map.json'), 'utf8'));
+  const conditional = map.rules.filter((rule) => (rule.conditions || []).length > 0);
+  assert(conditional.length >= 5, 'expected at least 5 conditional rules, got ' + conditional.length);
+  for (const kind of ['pseudoClass', 'pseudoElement', 'media', 'container', 'supports']) {
+    assert(
+      conditional.some((rule) => rule.conditions.some((condition) => condition.kind === kind)),
+      'manifest has no ' + kind + ' rule',
+    );
+  }
+  const html = readFileSync(INDEX, 'utf8');
+  for (const rule of conditional) {
+    assert(html.includes(rule.className), 'no element carries conditional class ' + rule.className);
+  }
+  for (const marker of [':hover', '::before', '@media', '@container', '@supports']) {
+    assert(cssText.includes(marker), 'stylesheet lacks ' + marker);
+  }
+  return conditional.length + ' conditional classes mounted';
+});
+
 const failed = results.filter((r) => !r.ok);
 console.log('');
 console.log((results.length - failed.length) + '/' + results.length + ' checks passed');

@@ -5,6 +5,7 @@ import dev.kairos.render.Node
 import dev.kairos.render.TextNode
 import dev.kairos.render.el
 import dev.kairos.render.href
+import dev.kairos.render.isSafeUrl
 
 /**
  * A small Markdown subset, rendered to Kairos nodes.
@@ -18,7 +19,26 @@ import dev.kairos.render.href
 private val TICK: Char = 0x60.toChar()
 private val FENCE: String = TICK.toString().repeat(3)
 
-fun renderMarkdown(source: String): List<Node> {
+/** Class names applied to the generated elements; empty means "browser default". */
+@dev.kairos.ExperimentalKairosApi
+data class MarkdownStyles(
+    val heading1: String = "",
+    val heading2: String = "",
+    val heading3: String = "",
+    val paragraph: String = "",
+    val codeBlock: String = "",
+    val code: String = "",
+    val blockquote: String = "",
+    val list: String = "",
+    val listItem: String = "",
+    val link: String = "",
+)
+
+private fun ElementNode.withStyle(className: String) {
+    if (className.isNotEmpty()) style = className
+}
+
+fun renderMarkdown(source: String, styles: MarkdownStyles = MarkdownStyles()): List<Node> {
     val nodes = ArrayList<Node>()
     val lines = source.replace("\r\n", "\n").split("\n")
     var index = 0
@@ -34,24 +54,27 @@ fun renderMarkdown(source: String): List<Node> {
                     index++
                 }
                 index++
-                nodes += el("pre") { add(el("code") { text(code.toString()) }) }
+                nodes += el("pre") {
+                    withStyle(styles.codeBlock)
+                    add(el("code") { withStyle(styles.code); text(code.toString()) })
+                }
             }
 
             line.startsWith("### ") -> {
                 val content = line.removePrefix("### ")
-                nodes += el("h3") { inlineInto(this, content) }
+                nodes += el("h3") { withStyle(styles.heading3); inlineInto(this, content, styles) }
                 index++
             }
 
             line.startsWith("## ") -> {
                 val content = line.removePrefix("## ")
-                nodes += el("h2") { inlineInto(this, content) }
+                nodes += el("h2") { withStyle(styles.heading2); inlineInto(this, content, styles) }
                 index++
             }
 
             line.startsWith("# ") -> {
                 val content = line.removePrefix("# ")
-                nodes += el("h1") { inlineInto(this, content) }
+                nodes += el("h1") { withStyle(styles.heading1); inlineInto(this, content, styles) }
                 index++
             }
 
@@ -62,15 +85,15 @@ fun renderMarkdown(source: String): List<Node> {
                     index++
                 }
                 val text = quoted.joinToString(" ")
-                nodes += el("blockquote") { inlineInto(this, text) }
+                nodes += el("blockquote") { withStyle(styles.blockquote); inlineInto(this, text, styles) }
             }
 
             line.startsWith("- ") || line.startsWith("* ") -> {
-                val list = el("ul")
+                val list = el("ul") { withStyle(styles.list) }
                 while (index < lines.size && (lines[index].startsWith("- ") || lines[index].startsWith("* "))) {
                     val content = lines[index].substring(2)
-                    val item = el("li")
-                    inlineInto(item, content)
+                    val item = el("li") { withStyle(styles.listItem) }
+                    inlineInto(item, content, styles)
                     list.add(item)
                     index++
                 }
@@ -87,7 +110,7 @@ fun renderMarkdown(source: String): List<Node> {
                     index++
                 }
                 val content = paragraph.toString()
-                nodes += el("p") { inlineInto(this, content) }
+                nodes += el("p") { withStyle(styles.paragraph); inlineInto(this, content, styles) }
             }
         }
     }
@@ -95,8 +118,8 @@ fun renderMarkdown(source: String): List<Node> {
 }
 
 /** Appends the rendered markdown to an element. */
-fun ElementNode.markdown(source: String) {
-    renderMarkdown(source).forEach { add(it) }
+fun ElementNode.markdown(source: String, styles: MarkdownStyles = MarkdownStyles()) {
+    renderMarkdown(source, styles).forEach { add(it) }
 }
 
 private fun isBlockStart(line: String): Boolean =
@@ -104,7 +127,7 @@ private fun isBlockStart(line: String): Boolean =
         line.startsWith("> ") || line.startsWith("- ") || line.startsWith("* ") ||
         line.startsWith(FENCE)
 
-private fun inlineInto(parent: ElementNode, line: String) {
+private fun inlineInto(parent: ElementNode, line: String, styles: MarkdownStyles) {
     var index = 0
     val buffer = StringBuilder()
     fun flush() {
@@ -121,7 +144,8 @@ private fun inlineInto(parent: ElementNode, line: String) {
                 if (end > 0) {
                     flush()
                     val bold = line.substring(index + 2, end)
-                    parent.add(el("strong") { text(bold) })
+                    // Bold text may contain links; parse the span recursively.
+                    parent.add(el("strong") { inlineInto(this, bold, styles) })
                     index = end + 2
                 } else {
                     buffer.append(line[index]); index++
@@ -143,7 +167,7 @@ private fun inlineInto(parent: ElementNode, line: String) {
                 if (end > 0) {
                     flush()
                     val italic = line.substring(index + 1, end)
-                    parent.add(el("em") { text(italic) })
+                    parent.add(el("em") { inlineInto(this, italic, styles) })
                     index = end + 1
                 } else {
                     buffer.append(line[index]); index++
@@ -157,10 +181,17 @@ private fun inlineInto(parent: ElementNode, line: String) {
                     flush()
                     val label = line.substring(index + 1, close)
                     val url = line.substring(open + 1, endUrl)
-                    parent.add(el("a") {
-                        href = url
-                        text(label)
-                    })
+                    if (isSafeUrl(url)) {
+                        parent.add(el("a") {
+                            withStyle(styles.link)
+                            href = url
+                            text(label)
+                        })
+                    } else {
+                        // Untrusted markdown is never allowed to fail the render: the unsafe link
+                        // degrades to its label instead of becoming a live javascript: URL.
+                        parent.add(TextNode(label))
+                    }
                     index = endUrl + 1
                 } else {
                     buffer.append(line[index]); index++

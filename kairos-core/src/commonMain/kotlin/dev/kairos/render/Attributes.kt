@@ -22,7 +22,12 @@ class AttributeDelegate(
         thisRef.attributes[name] ?: fallback
 
     override fun setValue(thisRef: ElementNode, property: KProperty<*>, value: String) {
-        if (value.isEmpty()) thisRef.attributes.remove(name) else thisRef.attributes[name] = value
+        if (value.isEmpty()) {
+            thisRef.attributes.remove(name)
+            return
+        }
+        val safe = if (name.lowercase() in URL_ATTRIBUTES) requireSafeUrl(name, value) else value
+        thisRef.attributes[name] = safe
     }
 }
 

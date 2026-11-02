@@ -129,7 +129,41 @@ object Db {
 
     private fun allPosts(): List<Post> = sql.createQuery(Post::class) { select(table) }.execute()
 
-    fun posts(): List<Post> = allPosts().sortedByDescending { it.createdAt }
+    /** Newest first by default; `sort = "comments"` orders by comment count then recency. */
+    fun posts(sort: String = "newest"): List<Post> {
+        val all = allPosts()
+        return when (sort) {
+            "comments" -> {
+                val counts = commentCounts(all.map { it.id })
+                all.sortedWith(compareByDescending<Post> { counts[it.id] ?: 0 }.thenByDescending { it.createdAt })
+            }
+            else -> all.sortedByDescending { it.createdAt }
+        }
+    }
+
+    fun updatePost(id: Long, title: String, body: String) {
+        dataSource.connection.use { connection ->
+            connection.prepareStatement("update post set title = ?, body = ? where id = ?").use { statement ->
+                statement.setString(1, title)
+                statement.setString(2, body)
+                statement.setLong(3, id)
+                statement.executeUpdate()
+            }
+        }
+    }
+
+    fun deletePost(id: Long) {
+        dataSource.connection.use { connection ->
+            connection.prepareStatement("delete from comment where post_id = ?").use { statement ->
+                statement.setLong(1, id)
+                statement.executeUpdate()
+            }
+            connection.prepareStatement("delete from post where id = ?").use { statement ->
+                statement.setLong(1, id)
+                statement.executeUpdate()
+            }
+        }
+    }
 
     fun post(id: Long): Post? = allPosts().firstOrNull { it.id == id }
 

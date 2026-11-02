@@ -1,18 +1,18 @@
 import org.jetbrains.kotlin.gradle.dsl.JsModuleKind
 
 plugins {
-    kotlin("multiplatform") version "2.2.20"
+    alias(libs.plugins.kotlin.multiplatform)
+    alias(libs.plugins.kairos)
 }
 
-val kairosPluginProject = project(":kairos-compiler-plugin")
-val kairosPluginJarPath = kairosPluginProject.layout.buildDirectory.file("libs/kairos-compiler-plugin.jar")
-val kairosOutDir = layout.buildDirectory.dir("kairos")
 val jsOutputDir = layout.buildDirectory.dir("compileSync/js/main/productionExecutable/kotlin")
 val siteDir = layout.buildDirectory.dir("site")
 val referenceDir = layout.buildDirectory.dir("reference-site")
-
-val featureProject = project(":demo-web-feature")
-val featureOutDir = featureProject.layout.buildDirectory.dir("kairos")
+// The dev.kairos plugin writes one stylesheet per target/compilation. The static renderer and
+// the browser bundle must agree, so both sides are folded by the same plugin.
+val jsStylesDir = layout.buildDirectory.dir("kairos/js/main")
+val jvmStylesDir = layout.buildDirectory.dir("kairos/jvm/main")
+val featureStylesDir = project(":demo-web-feature").layout.buildDirectory.dir("kairos/js/main")
 
 kotlin {
     jvm()
@@ -22,11 +22,6 @@ kotlin {
         binaries.executable()
         compilerOptions {
             moduleKind.set(JsModuleKind.MODULE_UMD)
-            freeCompilerArgs.addAll(
-                "-Xplugin=" + kairosPluginJarPath.get().asFile.absolutePath,
-                "-P", "plugin:dev.kairos:outputDir=" + kairosOutDir.get().asFile.absolutePath,
-                "-P", "plugin:dev.kairos:module=demo-web",
-            )
         }
     }
 
@@ -47,71 +42,44 @@ kotlin {
     }
 }
 
-// The plugin writes kairos.css / kairos.map.json as a *side effect* of compilation. Declaring
-// that directory as a task output is what makes a clean build correct: without it Gradle can
-// restore the JS compilation from the build cache without ever running the plugin.
-val kairosCompileTasks = setOf("compileKotlinJs")
-// The static HTML renderer must produce exactly the same class lists as the browser build, so
-// the plugin runs on the JVM target too (extraction is a whole-module decision).
-tasks.named<org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile>("compileKotlinJvm") {
-    dependsOn(kairosPluginProject.tasks.named("jar"))
-    inputs.file(kairosPluginJarPath)
-    compilerOptions.freeCompilerArgs.addAll(
-        "-Xplugin=" + kairosPluginJarPath.get().asFile.absolutePath,
-        "-P", "plugin:dev.kairos:outputDir=" + layout.buildDirectory.dir("kairos-jvm").get().asFile.absolutePath,
-        "-P", "plugin:dev.kairos:module=demo-web-jvm",
-    )
-    outputs.dir(layout.buildDirectory.dir("kairos-jvm"))
-    outputs.cacheIf { false }
-}
-
-tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask<*>>().configureEach {
-    dependsOn(kairosPluginProject.tasks.named("jar"))
-    inputs.file(kairosPluginJarPath)
-    if (name in kairosCompileTasks) {
-        outputs.dir(kairosOutDir)
-        outputs.cacheIf { false }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Verification entry points
 // ---------------------------------------------------------------------------
 
 val jvmCompilation = kotlin.jvm().compilations.getByName("main")
-fun JavaExec.runtimeClasspath() {
+fun JavaExec.jvmRuntimeClasspath() {
     classpath = jvmCompilation.output.allOutputs + (jvmCompilation.runtimeDependencyFiles ?: files())
     mainClass.set("JvmMainKt")
 }
 
-val runJvmReference by tasks.registering(JavaExec::class) {
+val runJvmReference = tasks.register<JavaExec>("runJvmReference") {
     group = "verification"
-    description = "Runs the demo on the JVM without the Kairos plugin (runtime fallback reference)."
+    description = "Renders the demo through the JVM path (static HTML class lists)."
     dependsOn("jvmMainClasses")
-    runtimeClasspath()
+    jvmRuntimeClasspath()
     args(referenceDir.get().asFile.absolutePath)
 }
 
-val runJsTierOne by tasks.registering(Exec::class) {
+val runJsTierOne = tasks.register<Exec>("runJsTierOne") {
     group = "verification"
     description = "Runs the folded JavaScript bundle under Node."
     dependsOn("compileProductionExecutableKotlinJs")
-    commandLine("node", jsOutputDir.get().asFile.resolve("kairos-demo.js").absolutePath)
+    commandLine("node", jsOutputDir.get().asFile.resolve("kairos-demo-web.js").absolutePath)
 }
 
 // ---------------------------------------------------------------------------
 // Static site assembly: render -> copy -> merge module maps -> prune
 // ---------------------------------------------------------------------------
 
-val renderSite by tasks.registering(JavaExec::class) {
+val renderSite = tasks.register<JavaExec>("renderSite") {
     group = "build"
     description = "Renders the static index.html with the JVM renderer."
     dependsOn("jvmMainClasses")
-    runtimeClasspath()
+    jvmRuntimeClasspath()
     args(referenceDir.get().asFile.absolutePath)
 }
 
-val prepareSite by tasks.registering(Sync::class) {
+val prepareSite = tasks.register<Sync>("prepareSite") {
     group = "build"
     dependsOn(renderSite, "compileProductionExecutableKotlinJs")
     into(siteDir)
@@ -123,47 +91,58 @@ val prepareSite by tasks.registering(Sync::class) {
 // The tooling module is a plain JVM application; running it from the build keeps the merge and
 // prune steps identical to what a user would run by hand.
 val cliProject = project(":kairos-cli")
-val cliJar = cliProject.layout.buildDirectory.file("libs/kairos-cli.jar")
+val cliJar = cliProject.layout.buildDirectory.file("libs/" + cliProject.name + "-" + cliProject.version + ".jar")
 // Cross project task lookup must stay lazy: ':kairos-cli' may not be evaluated yet while
-// ':demo' is being configured.
+// ':demo' is being configured. The configuration is resolved in the configuration phase
+// because Gradle 9 forbids resolving another project's configuration from a task action.
 val cliClasspath = files(cliJar)
 
-val kairosMerge by tasks.registering(JavaExec::class) {
+val kairosMerge = tasks.register<JavaExec>("kairosMerge") {
     group = "build"
     description = "Merges every module's sidecar map into one layered stylesheet."
     dependsOn(prepareSite, ":demo-web-feature:compileKotlinJs", ":kairos-cli:jar")
     classpath = cliClasspath
     mainClass.set("dev.kairos.cli.MainKt")
     doFirst {
-        classpath = classpath + cliProject.configurations.getByName("runtimeClasspath")
         val out = siteDir.get().asFile.resolve("kairos.css")
         args = listOf(
             "merge",
             "--out", out.absolutePath,
-            "--map", kairosOutDir.get().asFile.resolve("kairos.map.json").absolutePath,
-            "--map", featureOutDir.get().asFile.resolve("kairos.map.json").absolutePath,
+            "--map", jsStylesDir.get().asFile.resolve("kairos.map.json").absolutePath,
+            "--map", featureStylesDir.get().asFile.resolve("kairos.map.json").absolutePath,
         )
     }
 }
 
-val kairosPrune by tasks.registering(JavaExec::class) {
+val kairosPrune = tasks.register<JavaExec>("kairosPrune") {
     group = "build"
     description = "Drops rules whose class never appears in the shipped html / js."
     dependsOn(kairosMerge)
     classpath = cliClasspath
     mainClass.set("dev.kairos.cli.MainKt")
     doFirst {
-        classpath = classpath + cliProject.configurations.getByName("runtimeClasspath")
         val site = siteDir.get().asFile
         val css = site.resolve("kairos.css")
         val units = site.listFiles { file -> file.isFile && (file.name.endsWith(".html") || file.name.endsWith(".js")) }
             ?.sortedBy { it.name } ?: emptyList()
-        args = listOf("prune", "--css", css.absolutePath, "--out", css.absolutePath) +
-            units.flatMap { listOf("--unit", it.absolutePath) }
+        args = listOf(
+            "prune",
+            "--css", css.absolutePath,
+            "--out", css.absolutePath,
+            "--map", site.resolve("kairos.map.json").absolutePath,
+        ) + units.flatMap { listOf("--unit", it.absolutePath) }
     }
 }
 
-val assembleSite by tasks.registering {
+cliProject.afterEvaluate {
+    // Force resolution while still in the configuration phase: Gradle 9 rejects resolving
+    // another project's configuration from inside a task action.
+    val runtimeClasspath = configurations.getByName("runtimeClasspath").files
+    kairosMerge.configure { classpath = files(cliJar, runtimeClasspath) }
+    kairosPrune.configure { classpath = files(cliJar, runtimeClasspath) }
+}
+
+val assembleSite = tasks.register("assembleSite") {
     group = "build"
     description = "Assembles the merged, pruned static site into demo-web/build/site."
     dependsOn(kairosPrune)

@@ -1,5 +1,6 @@
 plugins {
-    kotlin("jvm") version "2.2.20"
+    alias(libs.plugins.kotlin.jvm)
+    `maven-publish`
 }
 
 kotlin {
@@ -8,4 +9,12 @@ kotlin {
 
 dependencies {
     implementation(project(":kairos-core"))
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("maven") {
+            from(components["java"])
+        }
+    }
 }
